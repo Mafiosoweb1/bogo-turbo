@@ -4,6 +4,13 @@
 
 Made by **MAF** · MIT License · Windows & Linux · NVIDIA RTX 20xx–50xx
 
+> **Origin:** this is a modified, heavily optimized version of a community CUDA
+> worker for the official [bogosort](https://bogo.swapjs.dev/) project by swap &
+> tomcat (official native client: [bogominer](https://gitlab.com/ttomcat/bogominer)).
+> Same engine, same v5 lease protocol, byte-identical results — just much faster.
+> Other clients for the project are catalogued in
+> [awesome-bogominers](https://github.com/mnhttn-cafe/awesome-bogominers).
+
 ---
 
 ## What is this?
@@ -53,7 +60,7 @@ docs/   optimization write-up (EN summary + full CZ history)
 
 ## Credits
 
-Made by **MAF**. Builds on the community bogosort project by swap/tomcat (the lease/range protocol v5 and the reference shuffle engine) and on the original community CUDA worker this client descends from. Thanks to the bogo community for keeping the leaderboard fun.
+Made by **MAF**. This client is a modified and optimized descendant of a community CUDA worker for [bogosort](https://bogo.swapjs.dev/) — the crowd-compute project by **swap & tomcat** (official native client: [bogominer](https://gitlab.com/ttomcat/bogominer)), whose lease/range protocol (v5) and reference shuffle engine (SplitMix64 → xoshiro128++ → Fisher-Yates) this worker implements byte-exactly. Sibling implementations live in [awesome-bogominers](https://github.com/mnhttn-cafe/awesome-bogominers). Thanks to the bogo community for keeping the leaderboard fun.
 
 ## License
 
