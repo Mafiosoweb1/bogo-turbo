@@ -1,6 +1,6 @@
 # bogo-turbo
 
-**A fast CUDA worker for the [bogosort crowd-compute project](https://bogo.swapjs.dev) — ~1.6× the throughput of the baseline CUDA worker, with results byte-identical to the official engine and verified by the server (0 rejected).**
+**A fast CUDA worker for the [bogosort crowd-compute project](https://bogo.swapjs.dev) — ~2.6× the original CUDA worker it grew from (~1.6× the count-only baseline), with results byte-identical to the official engine and verified by the server (0 rejected).**
 
 Made by **MAF** · MIT License · Windows & Linux · NVIDIA RTX 20xx–50xx
 
@@ -10,11 +10,14 @@ Made by **MAF** · MIT License · Windows & Linux · NVIDIA RTX 20xx–50xx
 
 [bogo.swapjs.dev](https://bogo.swapjs.dev) is a community project where contributors burn GPU cycles shuffling a 25-card deck (Fisher-Yates + xoshiro128++), hunting for shuffles with the most fixed points. This repository contains an optimized native CUDA worker for it:
 
-| | baseline CUDA worker | **bogo-turbo** |
-|---|---|---|
-| RTX 4080 SUPER, server-measured | 29.65 B shuffles/s | **47.2 B shuffles/s** |
-| results | byte-identical | byte-identical |
-| rejected reports | 0 | 0 |
+| | original CUDA worker | count-only baseline | **bogo-turbo** |
+|---|---|---|---|
+| RTX 4080 SUPER throughput | ~18 B shuffles/s | 29.65 B shuffles/s | **47.2 B shuffles/s** |
+| results | byte-identical | byte-identical | byte-identical |
+| rejected reports | 0 | 0 | 0 |
+
+(The count-only and turbo numbers are server-measured; the original is where this
+worker's lineage started on the same card, before any of the optimizations below.)
 
 Rough expectations on other cards: RTX 2060 ≈ 6–8 B/s, RTX 3070 ≈ 15 B/s, RTX 4070 ≈ 25 B/s.
 

@@ -1,8 +1,11 @@
 # Optimization history (English summary)
 
 How the worker went from **29.65 → 47.2 B shuffles/s** (server-verified) on an
-RTX 4080 SUPER in one day of measure-first engineering. The full Czech
-write-up with every number lives in [OPTIMIZATIONS_CZ.md](OPTIMIZATIONS_CZ.md).
+RTX 4080 SUPER in one day of measure-first engineering — and from **~18 B/s**
+counting the worker's whole lineage (the count-only kernel rewrite that
+preceded this work took the original ~18–22 B/s worker to 29.65). The full
+Czech write-up with every number lives in
+[OPTIMIZATIONS_CZ.md](OPTIMIZATIONS_CZ.md).
 
 The engine constraint throughout: the server verifies the best reported triple
 `(index, permutation, count)` and the PRNG sequence (SplitMix64 → xoshiro128++ →
@@ -13,7 +16,8 @@ below change *how much work* is done, never *what is reported*.
 
 | step | rate | gain | idea |
 |---|---|---|---|
-| baseline (count-only kernel) | 29.65 B/s | — | shared-memory `[pos][tid]` Fisher-Yates, count fixed points inline |
+| original worker (lineage start) | ~18–22 B/s | — | pre-history: shared-memory Fisher-Yates with a separate 25-wide count loop |
+| baseline (count-only kernel) | 29.65 B/s | +~1.3× | shared-memory `[pos][tid]` Fisher-Yates, count fixed points inline (predates this repo's work) |
 | **1. branch-and-bound pruning** | 39.8 B/s | +34 % | position `i` finalizes at step `i`, so `c + i + 1 ≤ batch_best` ⇒ the index can never win ⇒ skip the rest (alpha-beta style). Batch best is shared via `atomicMax` and polled with `__ldcg`; a stale (lower) value only prunes less, never wrong. Winners are recomputed in full. Screen depth: steps 24..11 unchecked, 10..1 checked (swept; warp divergence makes per-step checks from the start slower) |
 | **2. optimistic draws** | 43.1 B/s | +8 % | found via SASS audit: 24 rejection-sampling loops (taken ~once per 18M indices) forced 42 BSSY/BSYNC pairs and blocked cross-step scheduling. Hot path runs straight-line; a would-be rejection sets a `bad` flag and the index is recomputed exactly on a cold path. A rejection can only hide in steps never executed, so a flag-free prefix is provably byte-exact |
 | **3. H-mask reformulation** | 45–47 B/s | +7 % | the count is a function of the j-sequence alone: position `i` is fixed iff `j_i == i` **and** no earlier (higher-i) step hit `i`; position 0 iff never hit. Proof sketch: value `i+1` cannot move before step `i` — any hit finalizes it elsewhere. The hot loop keeps a 25-bit hit mask in a register: **no array, no shared memory, no init stores, 100 % occupancy**. Exact permutations are materialized only on cold paths (winners ~100× per launch, local memory) |
