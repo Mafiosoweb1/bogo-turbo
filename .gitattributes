@@ -1,0 +1,12 @@
+# normalize text, keep scripts runnable on their native platforms
+* text=auto
+*.sh text eol=lf
+*.bat text eol=crlf
+*.cu text
+*.cpp text
+*.md text
+*.txt text
+
+# binaries
+*.exe binary
+*.dll binary

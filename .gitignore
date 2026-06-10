@@ -1,0 +1,14 @@
+# build artifacts (dist/ binaries are committed intentionally)
+src/*.exe
+src/*.dll
+src/*.exp
+src/*.lib
+src/*.obj
+src/*.pdb
+*.zip
+
+# editor/os noise
+.vs/
+*.suo
+Thumbs.db
+desktop.ini
