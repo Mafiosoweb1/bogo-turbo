@@ -44,8 +44,12 @@ vcpkg is only needed for the worker; the benchmarks build with CUDA + MSVC alone
 - *unresolved `__imp_*` CRT symbols* — keep `-Xcompiler "/MD"` (must match the
   dynamic CRT of the vcpkg libraries).
 - *`ixwebsocket` not found* — run the vcpkg install line, or set `VCPKG_ROOT`.
-- *worker prints `Set BOGO_UUID...`* — correct behavior: credentials come from
-  environment variables (use `dist/start_turbo.bat` or set them yourself).
+- *worker prints `[ERROR] Missing credentials`* — correct behavior: credentials
+  come from environment variables (use `dist/start_turbo.bat` or set them
+  yourself). The nickname must be 8 characters or fewer (server rule).
+- *worker prints `=== WORKER STOPPED ===`* — every fatal problem (rejected
+  login, no usable GPU, CUDA error, …) ends like this on purpose: the reason
+  is printed and the window stays open until Enter is pressed.
 - *driver reset (TDR) on very slow GPUs* — lower `CHUNK_SIZE` in the `.cu`
   (default here 2^31; 2^30 halves the per-launch time again).
 

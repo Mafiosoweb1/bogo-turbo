@@ -32,7 +32,12 @@ Rough expectations on other cards: RTX 2060 ≈ 6–8 B/s, RTX 3070 ≈ 15 B/s, 
 
 1. Download the [`dist/`](dist/) folder (keep all DLLs next to the exe).
 2. Get your account credentials (UUID, nickname, code) at [bogo.swapjs.dev](https://bogo.swapjs.dev/contribute).
+   The nickname must be **8 characters or fewer** (server rule).
 3. Run `start_turbo.bat`, enter the credentials, watch the dashboard.
+
+If anything goes wrong (bad nickname, rejected login, unsupported GPU, …) the
+worker stops with a plain-English `=== WORKER STOPPED ===` summary and keeps
+the window open — see [`dist/README.md`](dist/README.md#if-something-goes-wrong).
 
 Requirements: Windows 10/11 x64, a recent NVIDIA driver, an RTX 20xx/30xx/40xx/50xx GPU. No CUDA Toolkit needed (static cudart) and no VC++ redist install needed (app-local DLLs). See [`dist/README.md`](dist/README.md).
 
