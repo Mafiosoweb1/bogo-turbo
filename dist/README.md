@@ -8,7 +8,8 @@ shipped app-local. Nothing to install.
 
 1. Keep this whole folder together (the exe needs the DLLs next to it).
 2. Get your own account at <https://bogo.swapjs.dev> (contribute section):
-   UUID, nickname and code (`xxxx-xxxx-xxxx-xxxx`).
+   UUID, nickname and code (`xxxx-xxxx-xxxx-xxxx`). **The nickname must be
+   8 characters or fewer** (server rule) — plain ASCII is safest.
 3. Run `start_turbo.bat` and enter them — or set the environment variables
    `BOGO_UUID`, `BOGO_NICKNAME`, `BOGO_CODE` permanently and skip the questions.
 4. Watch the dashboard: **Kernel rate** is your speed, **Rejected must stay 0**.
@@ -33,3 +34,17 @@ shipped app-local. Nothing to install.
 - One worker per machine — the server allows a single connection.
 - Credentials are read from environment variables only; nothing is written to
   disk by the worker.
+
+## If something goes wrong
+
+The worker never dies silently: on any problem (bad nickname, rejected login,
+no usable GPU, CUDA error, …) it stops, prints a `=== WORKER STOPPED ===`
+summary with the reason in plain English and waits for Enter, so the window
+stays open. Common ones:
+
+- `Nickname ... is N characters long` — the server requires 8 or fewer.
+- `server rejected the login: ...` — the server's reason is shown verbatim.
+- `no usable CUDA GPU` / `CUDA error: ...` — NVIDIA GPU (RTX 20xx or newer)
+  and a recent driver are required.
+- `Status: connection failed; retrying` on the dashboard — network/firewall
+  problem; the `Server:` line shows the underlying error.

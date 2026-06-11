@@ -47,21 +47,48 @@
 #include <ixwebsocket/IXWebSocket.h>
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
+#include <windows.h>   // wide-char environment read + UTF-8 conversion
+#endif
+
 using json = nlohmann::json;
 
+// Every CUDA error is a fail state: the worker must stop visibly instead of
+// looping over a broken device and pretending to compute.
 #define CUDA_CHECK(call)                                                                  \
     do {                                                                                  \
         cudaError_t err__ = (call);                                                       \
         if (err__ != cudaSuccess) {                                                       \
-            std::cerr << "\n[CUDA ERROR] " << cudaGetErrorString(err__)                   \
-                      << " at " << __FILE__ << ":" << __LINE__ << std::endl;              \
+            std::string msg__ = std::string("CUDA error: ") + cudaGetErrorString(err__) + \
+                                " (" + __FILE__ + ":" + std::to_string(__LINE__) + ")";   \
+            if (err__ == cudaErrorNoKernelImageForDevice)                                 \
+                msg__ += " - this GPU is not supported by this build (RTX 20xx or newer required)"; \
+            fail(msg__);                                                                  \
         }                                                                                 \
     } while (0)
 
 // ─── ACCOUNT (from environment, never hardcoded) ─────────────────────────────
+// Read an environment variable as UTF-8. On Windows the value is fetched via
+// the wide API and converted explicitly: values typed into cmd (set /p) arrive
+// in the process environment as UTF-16, and the narrow getenv() would hand
+// them over re-encoded in the legacy codepage — accented nicknames then were
+// invalid UTF-8 and json::dump() threw, killing the process at "starting".
 static std::string env_or_empty(const char* name) {
+#ifdef _WIN32
+    wchar_t wname[64]{};
+    for (int i = 0; i < 63 && name[i]; ++i) wname[i] = static_cast<wchar_t>(name[i]);
+    wchar_t wval[512];
+    DWORD n = GetEnvironmentVariableW(wname, wval, 512);
+    if (n == 0 || n >= 512) return std::string();
+    int len = WideCharToMultiByte(CP_UTF8, 0, wval, static_cast<int>(n), nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return std::string();
+    std::string out(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wval, static_cast<int>(n), &out[0], len, nullptr, nullptr);
+    return out;
+#else
     const char* v = std::getenv(name);
     return (v && *v) ? std::string(v) : std::string();
+#endif
 }
 static const std::string UUID     = env_or_empty("BOGO_UUID");
 static const std::string NICKNAME = env_or_empty("BOGO_NICKNAME");
@@ -104,6 +131,7 @@ std::atomic<uint64_t> global_leases{0};
 std::atomic<uint64_t> global_rejected{0};
 std::atomic<uint64_t> global_reconnects{0};
 std::atomic<int> open_count{0};
+std::atomic<bool> got_welcome{false};
 std::atomic<uint64_t> current_lease_done{0};
 std::atomic<uint64_t> current_lease_count{0};
 std::atomic<double> gpu_rate{0.0};
@@ -137,6 +165,40 @@ static std::string rate_string(double r) {
 static void set_status(const std::string& s) { std::lock_guard<std::mutex> l(statusMutex); statusLine = s; }
 static void set_server_message(const std::string& s) { std::lock_guard<std::mutex> l(statusMutex); lastServerMessage = s; }
 static std::string json_redacted(json j) { if (j.contains("code")) j["code"] = "***"; return j.dump(); }
+
+// ─── FAIL STATES ─────────────────────────────────────────────────────────────
+// Every unrecoverable problem funnels through fail(): the reason is kept for
+// the exit summary, all threads are told to stop, and main() holds the window
+// open so the message stays readable even when the exe was double-clicked.
+std::atomic<bool> had_fatal{false};
+std::string fatalMessage;                  // guarded by statusMutex; first fail() wins
+static void fail(const std::string& msg);  // defined after the queues it notifies
+
+static bool utf8_valid(const std::string& s) {
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        int ext = (c < 0x80) ? 0 : (c >= 0xC2 && c <= 0xDF) ? 1
+                : (c >= 0xE0 && c <= 0xEF) ? 2 : (c >= 0xF0 && c <= 0xF4) ? 3 : -1;
+        if (ext < 0 || i + static_cast<size_t>(ext) >= n) return false;
+        for (int k = 1; k <= ext; ++k)
+            if ((static_cast<unsigned char>(s[i + static_cast<size_t>(k)]) & 0xC0) != 0x80) return false;
+        i += static_cast<size_t>(ext) + 1;
+    }
+    return true;
+}
+static size_t utf8_length(const std::string& s) {   // code points, not bytes
+    size_t n = 0;
+    for (char c : s) if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) n++;
+    return n;
+}
+static void wait_for_enter() {
+    if (tester_mode.load(std::memory_order_relaxed)) return;  // --tester runs unattended
+    std::cout << "\nPress Enter to exit..." << std::flush;
+    std::cin.clear();
+    std::string line;
+    std::getline(std::cin, line);
+}
 
 // ─── KERNEL ──────────────────────────────────────────────────────────────────
 // PRNG seeding, byte-identical to the official engine:
@@ -390,8 +452,25 @@ static void queue_send(int conn_idx, const json& payload) {
     resultCV.notify_one();
 }
 
+static void fail(const std::string& msg) {
+    { std::lock_guard<std::mutex> l(statusMutex); if (fatalMessage.empty()) fatalMessage = msg; }
+    had_fatal.store(true, std::memory_order_relaxed);
+    set_status("ERROR: " + msg);
+    running.store(false, std::memory_order_relaxed);
+    jobCV.notify_all();
+    resultCV.notify_all();
+}
+
 // ─── COMPUTE WORKER ──────────────────────────────────────────────────────────
 void worker_thread(int) {
+    int dev_count = 0;
+    cudaError_t derr = cudaGetDeviceCount(&dev_count);
+    if (derr != cudaSuccess || dev_count == 0) {
+        fail(std::string("no usable CUDA GPU (") +
+             (derr != cudaSuccess ? cudaGetErrorString(derr) : "0 devices found") +
+             ") - an NVIDIA GPU and a recent driver are required");
+        return;
+    }
     CUDA_CHECK(cudaSetDevice(0));
     unsigned long long* dev_best = nullptr;
     uint8_t* dev_arrays = nullptr;
@@ -455,8 +534,7 @@ void worker_thread(int) {
             }
             set_status("waiting for next lease");
         } catch (const std::exception& e) {
-            set_status(std::string("worker error: ") + e.what());
-            std::cerr << "\n[WORKER] " << e.what() << std::endl;
+            fail(std::string("worker error: ") + e.what());
         }
     }
     if (dev_best) cudaFree(dev_best);
@@ -498,6 +576,7 @@ ix::WebSocket* make_connection(int idx) {
     ws->setExtraHeaders(headers);
 
     ws->setOnMessageCallback([idx](const ix::WebSocketMessagePtr& msg) {
+      try {
         if (msg->type == ix::WebSocketMessageType::Open) {
             ws_open.store(true, std::memory_order_relaxed);
             if (open_count.fetch_add(1) > 0) {
@@ -516,6 +595,7 @@ ix::WebSocket* make_connection(int idx) {
                 json data = json::parse(msg->str);
                 const std::string type = data.value("type", "");
                 if (type == "welcome") {
+                    got_welcome.store(true, std::memory_order_relaxed);
                     uint64_t lifetime = data.value("lifetime_shuffles", (uint64_t)0);
                     set_server_message("welcome; lifetime=" + comma_u64(lifetime));
                     set_status("waiting for lease");
@@ -538,8 +618,17 @@ ix::WebSocket* make_connection(int idx) {
                         jobCV.notify_all(); resultCV.notify_all();
                     }
                 } else if (type == "rejected") {
-                    global_rejected.fetch_add(1, std::memory_order_relaxed);
-                    set_server_message("rejected: " + msg->str.substr(0, 200));
+                    const std::string reason = data.value("reason", msg->str.substr(0, 200));
+                    if (!got_welcome.load(std::memory_order_relaxed)) {
+                        // The login (hello) itself was rejected: retrying can
+                        // never succeed, so stop with the reason instead of
+                        // hammering the server with reconnects.
+                        if (connections[idx]) connections[idx]->disableAutomaticReconnection();
+                        fail("server rejected the login: " + reason);
+                    } else {
+                        global_rejected.fetch_add(1, std::memory_order_relaxed);
+                        set_server_message("rejected: " + reason);
+                    }
                 } else if (type == "client_outdated") {
                     set_server_message("client_outdated: " + data.value("message", ""));
                     set_status("client outdated; stopping");
@@ -560,15 +649,23 @@ ix::WebSocket* make_connection(int idx) {
             }
         } else if (msg->type == ix::WebSocketMessageType::Close) {
             ws_open.store(false, std::memory_order_relaxed);
+            if (running.load(std::memory_order_relaxed)) set_status("disconnected; reconnecting");
             set_server_message("closed code=" + std::to_string(msg->closeInfo.code) + " " +
                                msg->closeInfo.reason + " (auto-reconnecting)");
             jobCV.notify_all(); resultCV.notify_all();
         } else if (msg->type == ix::WebSocketMessageType::Error) {
             ws_open.store(false, std::memory_order_relaxed);
+            if (running.load(std::memory_order_relaxed)) set_status("connection failed; retrying");
             set_server_message("error: " + msg->errorInfo.reason + " status=" +
                                std::to_string(msg->errorInfo.http_status) + " (retrying)");
             jobCV.notify_all(); resultCV.notify_all();
         }
+      } catch (const std::exception& e) {
+        // An exception escaping this callback would unwind through the socket
+        // thread and kill the whole process with nothing on screen (the
+        // infamous frozen "starting") - turn it into a visible fail state.
+        fail(std::string("websocket handler error: ") + e.what());
+      }
     });
     return ws;
 }
@@ -609,8 +706,27 @@ int main(int argc, char** argv) {
         if (a == "--tester") tester_mode.store(true);
         else if (a == "--help" || a == "-h") { std::cout << "Usage: " << argv[0] << " [--tester]\n"; return 0; }
     }
+    // Credential fail states: catch every known bad input BEFORE connecting,
+    // with a clear message and the window held open.
     if (UUID.empty() || NICKNAME.empty() || CODE.empty()) {
-        std::cerr << "Set BOGO_UUID, BOGO_NICKNAME and BOGO_CODE environment variables first.\n";
+        std::cerr << "[ERROR] Missing credentials.\n"
+                     "        Set the BOGO_UUID, BOGO_NICKNAME and BOGO_CODE environment\n"
+                     "        variables, or run start_turbo.bat which asks for them.\n";
+        wait_for_enter();
+        return 1;
+    }
+    if (!utf8_valid(NICKNAME) || !utf8_valid(UUID) || !utf8_valid(CODE)) {
+        std::cerr << "[ERROR] Credentials contain bytes that are not valid UTF-8 text.\n"
+                     "        Use plain ASCII characters (a nickname with accents typed in\n"
+                     "        a non-Unicode console is the usual cause).\n";
+        wait_for_enter();
+        return 1;
+    }
+    if (utf8_length(NICKNAME) > 8) {
+        std::cerr << "[ERROR] Nickname \"" << NICKNAME << "\" is " << utf8_length(NICKNAME)
+                  << " characters long.\n"
+                     "        The server requires 8 characters or fewer - pick a shorter one.\n";
+        wait_for_enter();
         return 1;
     }
 
@@ -648,5 +764,20 @@ int main(int argc, char** argv) {
     for (int i = 0; i < NUM_CONNECTIONS; ++i) { if (connections[i]) { connections[i]->stop(); delete connections[i]; } }
     if (dash.joinable()) dash.join();
     ix::uninitNetSystem();
-    return 0;
+
+    // This point is only reached when something stopped the worker (a fatal
+    // error, a server stop, or the lifetime target) - Ctrl+C never gets here.
+    // Replay the reason and hold the window open so it stays readable even
+    // when the exe was double-clicked.
+    std::string status, server, fatalMsg;
+    {
+        std::lock_guard<std::mutex> l(statusMutex);
+        status = statusLine; server = lastServerMessage; fatalMsg = fatalMessage;
+    }
+    std::cout << "\n=== WORKER STOPPED ===\n";
+    if (!fatalMsg.empty()) std::cout << "Error:  " << fatalMsg << "\n";
+    if (!server.empty())   std::cout << "Server: " << server << "\n";
+    std::cout << "Status: " << status << "\n";
+    wait_for_enter();
+    return had_fatal.load() ? 1 : 0;
 }
