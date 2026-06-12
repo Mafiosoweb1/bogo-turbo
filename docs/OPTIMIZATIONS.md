@@ -1,10 +1,11 @@
 # Optimization history (English summary)
 
-How the worker went from **29.65 → 47.2 → ~65.8 B shuffles/s** on an RTX 4080
-SUPER through measure-first engineering — and from **~18 B/s** counting the
-worker's whole lineage (the count-only kernel rewrite that preceded this work
-took the original ~18–22 B/s worker to 29.65). The full Czech write-up with
-every number lives in [OPTIMIZATIONS_CZ.md](OPTIMIZATIONS_CZ.md).
+How the worker went from **29.65 → 47.2 → ~68 B shuffles/s** (all
+server-measured) on an RTX 4080 SUPER through measure-first engineering — and
+from **~18 B/s** counting the worker's whole lineage (the count-only kernel
+rewrite that preceded this work took the original ~18–22 B/s worker to 29.65).
+The full Czech write-up with every number lives in
+[OPTIMIZATIONS_CZ.md](OPTIMIZATIONS_CZ.md).
 
 The engine constraint throughout: the server verifies the best reported triple
 `(index, permutation, count)` and the PRNG sequence (SplitMix64 → xoshiro128++ →
@@ -30,6 +31,8 @@ Validated like every step before: best-score equality on 3 seeds × 2^30 + 40
 sub-ranges, CPU recheck of every reported triple, for **every** variant in the
 sweep. Steps 4–6 together: **44.4 → 65.5 B/s (+47 %) on the same bench**, with
 floor carry-over behavior measured at 67.5–68.2 B/s (floor-12/13 sweep).
+**Live server run (2026-06-13): ~68 B/s — was 47.2 with v1 (+44 %), 0
+rejected**, matching the floor-carry-over bench numbers.
 
 Nsight Compute on the step-3 kernel: ALU pipe 88.7 % (the wall), memory ~1 %,
 zero spills, ~409 lane-instructions per index — at the time believed to be

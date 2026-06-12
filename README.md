@@ -1,14 +1,14 @@
 # bogo-turbo
 
-**A fast CUDA worker for the [bogosort crowd-compute project](https://bogo.swapjs.dev) — ~3.6× the original CUDA worker it grew from (~2.2× the count-only baseline), with results byte-identical to the official engine and verified by the server (0 rejected).**
+**A fast CUDA worker for the [bogosort crowd-compute project](https://bogo.swapjs.dev) — ~3.8× the original CUDA worker it grew from (~2.3× the count-only baseline), with results byte-identical to the official engine and verified by the server (0 rejected).**
 
 Made by **MAF** · MIT License · Windows & Linux · NVIDIA RTX 20xx–50xx
 
-> **Update 2026-06-13 — turbo v2:** new popcount-bound kernel, **+47 % over v1
-> on the same bench (44.4 → ~65.8 B shuffles/s on an RTX 4080 SUPER)**. Same
-> byte-identical results, same full validation suite, prebuilt `dist/` binary
-> updated. What changed and why: [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)
-> (EN) / [docs/OPTIMIZATIONS_CZ.md](docs/OPTIMIZATIONS_CZ.md) (CZ).
+> **Update 2026-06-13 — turbo v2:** new popcount-bound kernel, **server-measured
+> ~68 B shuffles/s on an RTX 4080 SUPER (was 47.2, +44 %)**. Same byte-identical
+> results, same full validation suite, prebuilt `dist/` binary updated. What
+> changed and why: [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) (EN) /
+> [docs/OPTIMIZATIONS_CZ.md](docs/OPTIMIZATIONS_CZ.md) (CZ).
 
 > **Origin:** this is a modified, heavily optimized version of a community CUDA
 > worker for the official [bogosort](https://bogo.swapjs.dev/) project by swap &
@@ -25,13 +25,13 @@ Made by **MAF** · MIT License · Windows & Linux · NVIDIA RTX 20xx–50xx
 
 | | original CUDA worker | count-only baseline | turbo v1 | **bogo-turbo v2** |
 |---|---|---|---|---|
-| RTX 4080 SUPER throughput | ~18 B shuffles/s | 29.65 B shuffles/s | 47.2 B shuffles/s | **~65.8 B shuffles/s** |
+| RTX 4080 SUPER throughput | ~18 B shuffles/s | 29.65 B shuffles/s | 47.2 B shuffles/s | **~68 B shuffles/s** |
 | results | byte-identical | byte-identical | byte-identical | byte-identical |
 | rejected reports | 0 | 0 | 0 | 0 |
 
-(The count-only and turbo-v1 numbers are server-measured; v2 is bench-measured
-on the same card with the same validation suite — best-score equality against
-a full scan on 3 seeds × 2^30 plus 40 sub-ranges, CPU recheck of every triple.
+(All three optimized-worker numbers are server-measured on the same card; v2
+also passed the full local validation suite — best-score equality against a
+full scan on 3 seeds × 2^30 plus 40 sub-ranges, CPU recheck of every triple.
 The original is where this worker's lineage started, before any of the
 optimizations below.)
 

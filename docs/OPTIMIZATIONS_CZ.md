@@ -1,6 +1,6 @@
 # bogo_gpu_turbo / bogo_gpu_fast — optimalizované workery (2026-06-10, popcount bound 2026-06-13)
 
-## TURBO v2 ✅ ~2.15× — popcount bound, bench 65.8 B/s (doporučený default)
+## TURBO v2 ✅ ~2.3× — popcount bound, server naměřil ~68 B/s (doporučený default)
 
 `MAINBOGOGPU_NVIDIA_newAPI_turbo.cu` (tentýž soubor, kernel přepracovaný
 2026-06-13). Tři nové kroky nad H-mask kernelem, všechny ověřené stejnou
@@ -30,9 +30,11 @@ validační sadou (3 seedy × 2^30 + 40 podrozsahů + CPU recheck každé trojic
 
 Naměřeno (bench2, tentýž stroj, baseline 29.7–30.5): starý turbo kernel
 44.4 B/s → **hp<256,12> 65.5–65.8 B/s (+47 %)**; s floorem 12–13 (≈ chování
-carry-overu v ustáleném stavu) 67.5–68.2 B/s. Chunk sweep: 2^32 je o ~1.5 %
-rychlejší než 2^31, ale SHARE build zůstává na 2^31 kvůli TDR rezervě pomalých
-karet. Registry 40, žádná shared memory, 100% okupance.
+carry-overu v ustáleném stavu) 67.5–68.2 B/s. **Ostrý server (2026-06-13):
+~68 B/s — proti 47.2 u v1 je to +44 %, 0 rejected** — sedí přesně na bench
+čísla s carry-over floorem. Chunk sweep: 2^32 je o ~1.5 % rychlejší než 2^31,
+ale SHARE build zůstává na 2^31 kvůli TDR rezervě pomalých karet. Registry 40,
+žádná shared memory, 100% okupance.
 
 Pointa pro příště: profiler po kroku 3 ukazoval ALU pipe 88.7 % a „~92 %
 teoretického stropu daného povinnými ~14 tahy" — a stejně z toho šlo dostat
