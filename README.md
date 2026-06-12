@@ -4,6 +4,12 @@
 
 Made by **MAF** · MIT License · Windows & Linux · NVIDIA RTX 20xx–50xx
 
+> **Update 2026-06-13 — turbo v2:** new popcount-bound kernel, **+47 % over v1
+> on the same bench (44.4 → ~65.8 B shuffles/s on an RTX 4080 SUPER)**. Same
+> byte-identical results, same full validation suite, prebuilt `dist/` binary
+> updated. What changed and why: [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)
+> (EN) / [docs/OPTIMIZATIONS_CZ.md](docs/OPTIMIZATIONS_CZ.md) (CZ).
+
 > **Origin:** this is a modified, heavily optimized version of a community CUDA
 > worker for the official [bogosort](https://bogo.swapjs.dev/) project by swap &
 > tomcat (official native client: [bogominer](https://gitlab.com/ttomcat/bogominer)).
