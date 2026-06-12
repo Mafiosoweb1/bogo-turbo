@@ -1,6 +1,6 @@
 # bogo-turbo
 
-**A fast CUDA worker for the [bogosort crowd-compute project](https://bogo.swapjs.dev) — ~2.6× the original CUDA worker it grew from (~1.6× the count-only baseline), with results byte-identical to the official engine and verified by the server (0 rejected).**
+**A fast CUDA worker for the [bogosort crowd-compute project](https://bogo.swapjs.dev) — ~3.6× the original CUDA worker it grew from (~2.2× the count-only baseline), with results byte-identical to the official engine and verified by the server (0 rejected).**
 
 Made by **MAF** · MIT License · Windows & Linux · NVIDIA RTX 20xx–50xx
 
@@ -17,16 +17,19 @@ Made by **MAF** · MIT License · Windows & Linux · NVIDIA RTX 20xx–50xx
 
 [bogo.swapjs.dev](https://bogo.swapjs.dev) is a community project where contributors burn GPU cycles shuffling a 25-card deck (Fisher-Yates + xoshiro128++), hunting for shuffles with the most fixed points. This repository contains an optimized native CUDA worker for it:
 
-| | original CUDA worker | count-only baseline | **bogo-turbo** |
-|---|---|---|---|
-| RTX 4080 SUPER throughput | ~18 B shuffles/s | 29.65 B shuffles/s | **47.2 B shuffles/s** |
-| results | byte-identical | byte-identical | byte-identical |
-| rejected reports | 0 | 0 | 0 |
+| | original CUDA worker | count-only baseline | turbo v1 | **bogo-turbo v2** |
+|---|---|---|---|---|
+| RTX 4080 SUPER throughput | ~18 B shuffles/s | 29.65 B shuffles/s | 47.2 B shuffles/s | **~65.8 B shuffles/s** |
+| results | byte-identical | byte-identical | byte-identical | byte-identical |
+| rejected reports | 0 | 0 | 0 | 0 |
 
-(The count-only and turbo numbers are server-measured; the original is where this
-worker's lineage started on the same card, before any of the optimizations below.)
+(The count-only and turbo-v1 numbers are server-measured; v2 is bench-measured
+on the same card with the same validation suite — best-score equality against
+a full scan on 3 seeds × 2^30 plus 40 sub-ranges, CPU recheck of every triple.
+The original is where this worker's lineage started, before any of the
+optimizations below.)
 
-Rough expectations on other cards: RTX 2060 ≈ 6–8 B/s, RTX 3070 ≈ 15 B/s, RTX 4070 ≈ 25 B/s.
+Rough expectations on other cards (~1.4× the v1 numbers): RTX 2060 ≈ 9–11 B/s, RTX 3070 ≈ 21 B/s, RTX 4070 ≈ 35 B/s.
 
 ## Quick start (prebuilt, Windows)
 
@@ -47,11 +50,13 @@ Everything is in [`src/`](src/) with auto-detecting build scripts for Windows (M
 
 ## How it is fast (and still exact)
 
-The server credits the number of shuffles scanned and verifies the best reported triple `(index, permutation, fixed-point count)`. Three ideas stack on top of the baseline count-only kernel — none of them change a single reported byte:
+The server credits the number of shuffles scanned and verifies the best reported triple `(index, permutation, fixed-point count)`. Five ideas stack on top of the baseline count-only kernel — none of them change a single reported byte:
 
 1. **Branch-and-bound pruning** — in a high→low Fisher-Yates, position `i` is finalized at step `i`, so once `c + i + 1 ≤ batch best` the index can never win and the remaining steps are skipped (alpha-beta style). The winner is recomputed in full, so reports stay byte-identical.
 2. **Optimistic draws** — the RNG rejection-sampling loops (taken ~once per 18M indices) are removed from the hot path; a would-be rejection just sets a flag and the affected index is redone exactly on a cold path. Straight-line code lets the compiler schedule across all 24 steps.
 3. **H-mask reformulation** — the fixed-point count is a function of the draw sequence alone: position `i` is fixed iff `j_i == i` and no earlier step hit `i` (position 0 iff never hit). The hot loop therefore keeps just a 25-bit hit mask in a register: **no permutation array, no shared memory, 100% occupancy**. The exact permutation is materialized only for winners.
+4. **Popcount bound** (v2) — the pruning bound from idea 1 assumes every remaining position can still become fixed; the H mask knows better: position `p` can only become fixed while its bit is **still unhit**. The bound tightens to `c + popc(~H & low bits)`, which prunes almost every index immediately after the screen instead of walking a warp-divergent tail.
+5. **H/E split screen** (v2) — the screen keeps two pure OR-accumulators (`H` = all hits, `E` = hits from a foreign step), so fixed positions are just `H & ~E` and the entire bound test collapses to **one LOP3 + one POPC** with no per-draw compare and no dependency chain. Together with a shorter screen, a re-swept launch shape and carrying the report-window best into each launch's floor, v2 measures **+47% over v1** on the same bench.
 
 Every variant was validated against a CPU reference (best-score equality across seeds and 40 sub-ranges, plus CPU recheck of every reported triple) and profiled with Nsight Compute — the full optimization history, including everything that *didn't* work, is in [`docs/OPTIMIZATIONS_CZ.md`](docs/OPTIMIZATIONS_CZ.md) (Czech) and summarized in [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) (English).
 

@@ -1,6 +1,47 @@
-# bogo_gpu_turbo / bogo_gpu_fast — optimalizované workery (2026-06-10)
+# bogo_gpu_turbo / bogo_gpu_fast — optimalizované workery (2026-06-10, popcount bound 2026-06-13)
 
-## TURBO ✅ ~1.6× — server naměřil 47.2 B/s (doporučený default)
+## TURBO v2 ✅ ~2.15× — popcount bound, bench 65.8 B/s (doporučený default)
+
+`MAINBOGOGPU_NVIDIA_newAPI_turbo.cu` (tentýž soubor, kernel přepracovaný
+2026-06-13). Tři nové kroky nad H-mask kernelem, všechny ověřené stejnou
+validační sadou (3 seedy × 2^30 + 40 podrozsahů + CPU recheck každé trojice):
+
+1. **Popcount bound (+14 %).** Stará mez `c + i + 1 ≤ best` předpokládá, že
+   pevným bodem se může stát každá zbývající pozice. H-maska ale už ví víc:
+   pozice `p` se může stát pevnou jen pokud je její bit **dosud nezasažený**
+   (zásah ji finalizuje jinde). Nová mez `c + popc(~H & bity 0..i)` — po
+   screenu zbývá typicky jen ~5 nezasažených spodních bitů, takže skoro každý
+   index se prořeže okamžitě místo procházení 3–4 kroků divergentního ocasu.
+2. **H/E split screen (+13 %).** Per-draw účetnictví počtu
+   (`if (j==i && !(H & 1<<i)) c++` — porovnání + test bitu + predikovaný add,
+   serializované přes H) nahrazují dva čisté OR-akumulátory:
+   `H |= 1<<j` (všechny zásahy) a `E |= (1<<j) & ~(1<<i)` (zásahy z *cizího*
+   kroku; `j ≤ i`, takže netřeba porovnávat). Pevné bity = `H & ~E`, tedy
+   `c = popc(H & ~E)` — a protože jde o disjunktní množiny, celý test meze je
+   **jeden LOP3 + jeden POPC**: `popc((H & ~E) | (~H & LOWMASK)) > best`.
+3. **Kratší screen + nový tvar (+15 %).** Těsnější mez dovolila posunout test
+   o 2 kroky dřív (screen 24..13, test na kroku 12; sweep 10–13) a launch
+   přeladit na 256×2560 (dřív 128×2880).
+4. **Floor z okna reportu (+2–4 %).** Každý launch dostává jako floor dosavadní
+   maximum reportovacího okna (`winBest`) — kernel honí jen počty, které by
+   report *zlepšily*. Floor musí být přesně `winBest` (vyšší by mohl tiše
+   zahodit lepší nález pod ním); fallback relaunch s floor 0 zůstává jen pro
+   první chunk okna.
+
+Naměřeno (bench2, tentýž stroj, baseline 29.7–30.5): starý turbo kernel
+44.4 B/s → **hp<256,12> 65.5–65.8 B/s (+47 %)**; s floorem 12–13 (≈ chování
+carry-overu v ustáleném stavu) 67.5–68.2 B/s. Chunk sweep: 2^32 je o ~1.5 %
+rychlejší než 2^31, ale SHARE build zůstává na 2^31 kvůli TDR rezervě pomalých
+karet. Registry 40, žádná shared memory, 100% okupance.
+
+Pointa pro příště: profiler po kroku 3 ukazoval ALU pipe 88.7 % a „~92 %
+teoretického stropu daného povinnými ~14 tahy" — a stejně z toho šlo dostat
++47 %, protože strop padl reformulací toho, co je „povinné". Lekce
+„reformuluj, než začneš mikro-optimalizovat" platí rekurzivně.
+
+---
+
+## TURBO v1 ✅ ~1.6× — server naměřil 47.2 B/s (historie)
 
 `MAINBOGOGPU_NVIDIA_newAPI_turbo.cu` → `build_turbo.bat` → `start_turbo.bat`.
 

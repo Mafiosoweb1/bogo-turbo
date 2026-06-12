@@ -638,6 +638,103 @@ __global__ void __launch_bounds__(TPB) perf_h(
     }
 }
 
+// ───────── H-mask + POPCOUNT BOUND ───────────────────────────────────────────
+// The I+1 prune bound assumes every remaining position can still become a
+// fixed point. The H mask already knows better: position p can only become
+// fixed if bit p is UNHIT at test time (a hit finalizes it elsewhere), so
+//   max additional gain = popc(~H & bits 0..STOP)
+// — far tighter than STOP+1. perf_hq = perf_h + this test (isolates the bound).
+//
+// perf_hp additionally splits the screen into two pure OR-accumulators:
+//   H |= 1<<j                  (all hits, as before)
+//   E |= (1<<j) & ~(1<<I)      (hits from a FOREIGN step; at step I, j <= I,
+//                               so "j != I" is just masking out bit I — no
+//                               compare, no predicate, no H-read dependency)
+// A position is fixed iff its bit was hit ONLY by its own step: fixed = H & ~E,
+// c = popc(H & ~E). Low bits of H & ~E are always 0 in the screen (every low
+// hit is foreign), and (H & ~E) and (~H & LOWMASK) are disjoint, so the whole
+// bound test collapses to one LOP3 + one POPC:
+//   popc((H & ~E) | (~H & LOWMASK)) > lbg
+template<int I, int STOP>
+struct HESteps {
+    static __device__ __forceinline__ void run(unsigned int& H, unsigned int& E, unsigned int& bad,
+            unsigned int& s0, unsigned int& s1, unsigned int& s2, unsigned int& s3) {
+        unsigned int j = draw_opt<I + 1>(s0, s1, s2, s3, bad);
+        unsigned int m = 1u << j;
+        H |= m;
+        E |= m & ~(1u << I);
+        HESteps<I - 1, STOP>::run(H, E, bad, s0, s1, s2, s3);
+    }
+};
+template<int STOP>
+struct HESteps<STOP, STOP> {
+    static __device__ __forceinline__ void run(unsigned int&, unsigned int&, unsigned int&,
+            unsigned int&, unsigned int&, unsigned int&, unsigned int&) {}
+};
+
+template<int TPB, int STOP>
+__global__ void __launch_bounds__(TPB) perf_hq(
+    unsigned long long base_seed, unsigned long long lo, unsigned long long hi,
+    unsigned long long* best_and_tid, unsigned char* all_arrays, unsigned long long* all_idx) {
+    const unsigned int tid = blockIdx.x * TPB + threadIdx.x;
+    const unsigned long long stride = (unsigned long long)gridDim.x * TPB;
+    const unsigned long long n = hi - lo;
+    const unsigned int* lbsrc = ((const unsigned int*)best_and_tid) + 1;
+    constexpr unsigned int LOWMASK = (1u << (STOP + 1)) - 1u;
+    int lbg = (int)__ldcg(lbsrc);
+    unsigned int ctr = 0;
+    for (unsigned long long off = tid; off < n; off += stride) {
+        if ((ctr++ & 7u) == 0u) lbg = (int)__ldcg(lbsrc);
+        const unsigned long long index = lo + off;
+        unsigned int s0, s1, s2, s3;
+        seed_expand(index, base_seed, s0, s1, s2, s3);
+        int c = 0;
+        unsigned int H = 0, bad = 0;
+        HSteps<24, STOP>::run(c, H, bad, s0, s1, s2, s3);
+        if (c + __popc(~H & LOWMASK) > lbg) {              // tighter than STOP+1
+            if (HPruned<STOP>::run(c, H, lbg, bad, s0, s1, s2, s3)) {
+                if (!(H & 1u)) c++;
+            }
+        }   // pruned: c + popc <= lbg implies c <= lbg, so no publish below
+        if (bad)
+            lbg = exact_redo_l(index, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
+        else if (c > lbg)
+            lbg = publish_l(index, base_seed, c, tid, best_and_tid, all_arrays, all_idx);
+    }
+}
+
+template<int TPB, int STOP>
+__global__ void __launch_bounds__(TPB) perf_hp(
+    unsigned long long base_seed, unsigned long long lo, unsigned long long hi,
+    unsigned long long* best_and_tid, unsigned char* all_arrays, unsigned long long* all_idx) {
+    const unsigned int tid = blockIdx.x * TPB + threadIdx.x;
+    const unsigned long long stride = (unsigned long long)gridDim.x * TPB;
+    const unsigned long long n = hi - lo;
+    const unsigned int* lbsrc = ((const unsigned int*)best_and_tid) + 1;
+    constexpr unsigned int LOWMASK = (1u << (STOP + 1)) - 1u;
+    int lbg = (int)__ldcg(lbsrc);
+    unsigned int ctr = 0;
+    for (unsigned long long off = tid; off < n; off += stride) {
+        if ((ctr++ & 7u) == 0u) lbg = (int)__ldcg(lbsrc);
+        const unsigned long long index = lo + off;
+        unsigned int s0, s1, s2, s3;
+        seed_expand(index, base_seed, s0, s1, s2, s3);
+        unsigned int H = 0, E = 0, bad = 0;
+        int c = 0;
+        HESteps<24, STOP>::run(H, E, bad, s0, s1, s2, s3);
+        if ((int)__popc((H & ~E) | (~H & LOWMASK)) > lbg) { // c + maxgain, one POPC
+            c = __popc(H & ~E);
+            if (HPruned<STOP>::run(c, H, lbg, bad, s0, s1, s2, s3)) {
+                if (!(H & 1u)) c++;
+            }
+        }
+        if (bad)
+            lbg = exact_redo_l(index, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
+        else if (c > lbg)
+            lbg = publish_l(index, base_seed, c, tid, best_and_tid, all_arrays, all_idx);
+    }
+}
+
 // FIRSTC: step 24 runs on a fresh array, so vi = arr[24] = 25 is known without
 // loading. SPARSE: use the even-I-only bound tests in the tail.
 template<int TPB, int ISTOP, bool FIRSTC = false, bool SPARSE = false>
@@ -890,12 +987,14 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMalloc(&dp.arrays, 2048ull * 512ull * 25ULL));
         CUDA_CHECK(cudaMalloc(&dp.indices, 2048ull * 512ull * sizeof(uint64_t)));
         const uint64_t S = 0x123456789ABCDEFULL;
-        printf("Merim ~10 s...\n");
+        printf("Merim ~15 s...\n");
         double rb = bench(perf_base, S, dp, 4.0, 1920, 192, 0ULL);
         double rp = bench((PerfFn)perf_pruned<192, 10, unsigned int, 8, false>, S, dp, 4.0, 1920, 192, pfloor(8));
+        double rh = bench((PerfFn)perf_hp<256, 12>, S, dp, 4.0, 2560, 256, pfloor(8), 0);
         printf("\n  puvodni kernel : %6.2f B/s   (cisty stav ~29.7, pomaly stav ~21)\n", rb/1e9);
         printf("  fast kernel    : %6.2f B/s   (cisty stav ~40)\n", rp/1e9);
-        printf("  pomer          : %5.2fx\n\n", rp/rb);
+        printf("  turbo v2 kernel: %6.2f B/s   (cisty stav ~65)\n", rh/1e9);
+        printf("  pomer          : %5.2fx\n\n", rh/rb);
         if (rb >= 26e9)      printf("STAV: CISTY - GPU jede naplno, nic ho nebrzdi.\n");
         else if (rb >= 23e9) printf("STAV: MEZISTAV - neco na GPU lehce saha (prohlizec/overlay?).\n");
         else                 printf("STAV: POMALY - jina aplikace aktivne pouziva GPU. Spust gpu_who.ps1.\n");
@@ -908,12 +1007,14 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMalloc(&dp.best, sizeof(unsigned long long)));
         CUDA_CHECK(cudaMalloc(&dp.arrays, 2048ull * 512ull * 25ULL));
         CUDA_CHECK(cudaMalloc(&dp.indices, 2048ull * 512ull * sizeof(uint64_t)));
-        std::string which = (argc > 2) ? argv[2] : "h";
+        std::string which = (argc > 2) ? argv[2] : "hp";
         if (which == "base") run_once(perf_base, 0x123456789ABCDEFULL, 0, 1ull<<28, dp, 1920, 192, 0ULL);
         else if (which == "opt") run_once((PerfFn)perf_pruned<192,10,unsigned int,8,false>,
                       0x123456789ABCDEFULL, 0, 1ull<<28, dp, 1920, 192, pfloor(8));
-        else run_once((PerfFn)perf_h<128,10>, 0x123456789ABCDEFULL,
+        else if (which == "h") run_once((PerfFn)perf_h<128,10>, 0x123456789ABCDEFULL,
                       0, 1ull<<28, dp, 2880, 128, pfloor(8), 0);
+        else run_once((PerfFn)perf_hp<256,12>, 0x123456789ABCDEFULL,
+                      0, 1ull<<28, dp, 2560, 256, pfloor(8), 0);
         return 0;
     }
     double secs = (argc > 1) ? atof(argv[1]) : 2.5;
@@ -963,11 +1064,15 @@ int main(int argc, char** argv) {
     #define MKH(T, S) PV{ "h<" #T "," #S ">", (PerfFn)perf_h<T, S>, T, S, 0 }
     #define MKHF(T, S) PV{ "hf<" #T "," #S ">", (PerfFn)perf_hf<T, S>, T, S, 0 }
     #define MKHA(T, S) PV{ "ha<" #T "," #S ">", (PerfFn)perf_ha<T, S>, T, S, 0 }
+    #define MKHQ(T, S) PV{ "hq<" #T "," #S ">", (PerfFn)perf_hq<T, S>, T, S, 0 }
+    #define MKHP(T, S) PV{ "hp<" #T "," #S ">", (PerfFn)perf_hp<T, S>, T, S, 0 }
     std::vector<PV> pvs = {
-        MKH(128, 10),                    // shipped turbo kernel (anchor)
-        MKHA(128, 10),                   // adds-only -> IMAD (surgical)
-        MKHA(192, 10),
-        MKHA(256, 10),
+        MKH(128, 10),                    // turbo v1 kernel (historical anchor)
+        MKHQ(128, 10),                   // v1 + popcount bound only
+        MKHP(128, 12),                   // + H/E split screen
+        MKHP(96, 12),                    // shape sweep (STOP 10..13 and larger
+        MKHP(192, 12),                   //   TPB swept 2026-06-13; 256x12 won)
+        MKHP(256, 12),                   // shipped turbo v2 kernel
     };
 
     printf("%-24s %5s %5s %10s %9s   %-6s %-8s %-5s\n",
@@ -1019,6 +1124,15 @@ int main(int argc, char** argv) {
         double r = bench(w.fn, SEEDS[0], d, 2.0, swBest, w.tpb, pfloor(8), w.elemB, ch);
         int lg = 0; for (uint64_t x = ch; x > 1; x >>= 1) lg++;
         printf("2^%d:%.2f  ", lg, r/1e9);
+    }
+    printf("\n");
+
+    // Floor sweep: what carrying the report-window best into the launch floor
+    // buys (the worker can seed the floor with winBest instead of 8).
+    printf("\nfloor sweep (%s, blocks=%d):\n  ", w.name, swBest);
+    for (int f : {8, 10, 12, 13}) {
+        double r = bench(w.fn, SEEDS[0], d, 1.5, swBest, w.tpb, pfloor(f), w.elemB);
+        printf("f%d:%.2f  ", f, r/1e9);
     }
     printf("\n");
 

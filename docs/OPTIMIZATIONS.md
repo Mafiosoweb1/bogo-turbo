@@ -1,11 +1,10 @@
 # Optimization history (English summary)
 
-How the worker went from **29.65 → 47.2 B shuffles/s** (server-verified) on an
-RTX 4080 SUPER in one day of measure-first engineering — and from **~18 B/s**
-counting the worker's whole lineage (the count-only kernel rewrite that
-preceded this work took the original ~18–22 B/s worker to 29.65). The full
-Czech write-up with every number lives in
-[OPTIMIZATIONS_CZ.md](OPTIMIZATIONS_CZ.md).
+How the worker went from **29.65 → 47.2 → ~65.8 B shuffles/s** on an RTX 4080
+SUPER through measure-first engineering — and from **~18 B/s** counting the
+worker's whole lineage (the count-only kernel rewrite that preceded this work
+took the original ~18–22 B/s worker to 29.65). The full Czech write-up with
+every number lives in [OPTIMIZATIONS_CZ.md](OPTIMIZATIONS_CZ.md).
 
 The engine constraint throughout: the server verifies the best reported triple
 `(index, permutation, count)` and the PRNG sequence (SplitMix64 → xoshiro128++ →
@@ -22,10 +21,22 @@ below change *how much work* is done, never *what is reported*.
 | **2. optimistic draws** | 43.1 B/s | +8 % | found via SASS audit: 24 rejection-sampling loops (taken ~once per 18M indices) forced 42 BSSY/BSYNC pairs and blocked cross-step scheduling. Hot path runs straight-line; a would-be rejection sets a `bad` flag and the index is recomputed exactly on a cold path. A rejection can only hide in steps never executed, so a flag-free prefix is provably byte-exact |
 | **3. H-mask reformulation** | 45–47 B/s | +7 % | the count is a function of the j-sequence alone: position `i` is fixed iff `j_i == i` **and** no earlier (higher-i) step hit `i`; position 0 iff never hit. Proof sketch: value `i+1` cannot move before step `i` — any hit finalizes it elsewhere. The hot loop keeps a 25-bit hit mask in a register: **no array, no shared memory, no init stores, 100 % occupancy**. Exact permutations are materialized only on cold paths (winners ~100× per launch, local memory) |
 | host/config tuning | +1–2 % | | chunk 2^31→2^32 per launch, `best` floor pre-seeding with a no-find fallback relaunch |
+| **4. popcount bound** | 50.6 B/s | +14 % | the `c + i + 1 ≤ best` bound assumes every remaining position can still become fixed — but the H mask already knows better: position `p` can only become fixed if bit `p` is **still unhit** (a hit finalizes it elsewhere). New bound: `c + popc(~H & bits 0..i)`. After the screen only ~5 of 13 low bits are typically unhit, so almost every index now prunes immediately instead of walking a 3–4-step warp-divergent tail |
+| **5. H/E split screen** | 57.1 B/s | +13 % | the per-draw count bookkeeping (`if (j==i && !(H & 1<<i)) c++` — compare + mask test + predicated add, serialized on H) is replaced by two pure OR-accumulators: `H \|= 1<<j` (all hits) and `E \|= (1<<j) & ~(1<<i)` (hits from a *foreign* step; since `j ≤ i` no compare is needed). Fixed = `H & ~E`, so `c = popc(H & ~E)` — and because the two sets are disjoint, the whole bound test collapses to **one LOP3 + one POPC**: `popc((H & ~E) \| (~H & LOWMASK)) > best`. Both accumulators are reorderable by the scheduler — no dependency chain through the screen |
+| **6. shorter screen + shape re-sweep** | 65.5 B/s | +15 % | the far tighter bound lets the test move 2 steps earlier (screen 24..13, test at step 12 — swept 10–13) and the kernel shape re-swept to 256×2560 (was 128×2880) |
+| **7. window-best floor carry-over** | +2–4 % | | each launch's floor is pre-seeded with the report-window best so the kernel only chases counts that would *improve the report*; the floor must be exactly `winBest` (anything higher could silently drop a better find) and the floor-0 fallback relaunch is now needed only when no best is held yet |
 
-Nsight Compute on the final kernel: ALU pipe 88.7 % (the wall), memory ~1 %,
-zero spills, ~409 lane-instructions per index. The kernel sits at ~92 % of the
-theoretical ceiling implied by the mandatory ~14 of 24 draws per index.
+Validated like every step before: best-score equality on 3 seeds × 2^30 + 40
+sub-ranges, CPU recheck of every reported triple, for **every** variant in the
+sweep. Steps 4–6 together: **44.4 → 65.5 B/s (+47 %) on the same bench**, with
+floor carry-over behavior measured at 67.5–68.2 B/s (floor-12/13 sweep).
+
+Nsight Compute on the step-3 kernel: ALU pipe 88.7 % (the wall), memory ~1 %,
+zero spills, ~409 lane-instructions per index — at the time believed to be
+~92 % of the theoretical ceiling implied by the "mandatory" ~14 of 24 draws
+per index. Steps 4–6 then beat that ceiling by 47 % anyway, by shrinking what
+"mandatory" means: the lesson below about reformulating before
+micro-optimizing applies recursively.
 
 ## What did not work (all measured, so you don't have to)
 

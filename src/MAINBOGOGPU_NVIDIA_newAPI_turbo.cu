@@ -11,13 +11,24 @@
 // ║  permutation array, NO shared memory, 100% occupancy. The exact array    ║
 // ║  is materialized only on cold paths (publish / redo, local memory).      ║
 // ║                                                                          ║
+// ║  PLUS the POPCOUNT BOUND: a position can still become fixed only if its  ║
+// ║  bit is UNHIT, so the prune bound is popc of the unhit low bits instead  ║
+// ║  of "all remaining positions" — the test collapses to one LOP3 + POPC,   ║
+// ║  prunes nearly every index right after the screen (12 draws instead of   ║
+// ║  14 + a 3-4 step pruned tail), and the screen itself splits into two     ║
+// ║  pure OR-accumulators (H = all hits, E = foreign hits; fixed = H & ~E)   ║
+// ║  with no compare and no H-read dependency per draw. The report-window    ║
+// ║  best is carried into each launch's floor (publish only what would       ║
+// ║  improve the report).                                                    ║
+// ║                                                                          ║
 // ║  Everything stays byte-identical to the official engine: winners are     ║
 // ║  recomputed with the full exact shuffle; only the tie-break among        ║
 // ║  equal-count indices can differ from a full scan.                        ║
 // ║                                                                          ║
-// ║  Measured on RTX 4080 SUPER (bench2.cu): ~44.5 B/s vs 29.7 B/s original  ║
-// ║  (~1.6x), validated: best-score equality on 3 seeds x 2^30 + 40 sub-     ║
-// ║  ranges, CPU recheck of every reported triple.                           ║
+// ║  Measured on RTX 4080 SUPER (bench2.cu): ~65.8 B/s vs 44.4 B/s for the   ║
+// ║  previous turbo kernel and 29.7-30.5 B/s baseline (~2.15x), validated:   ║
+// ║  best-score equality on 3 seeds x 2^30 + 40 sub-ranges, CPU recheck of   ║
+// ║  every reported triple.                                                  ║
 // ║                                                                          ║
 // ║  Credentials come from environment variables (nothing hardcoded):        ║
 // ║    set BOGO_UUID=...   set BOGO_NICKNAME=...   set BOGO_CODE=...          ║
@@ -100,17 +111,20 @@ constexpr int NUM_CONNECTIONS = 1;
 constexpr int NUM_WORKERS     = 1;
 constexpr int NUM_SENDERS     = 1;
 
-// 128x2880 benched best for the H-mask kernel on the 4080 SUPER (bench2.cu);
-// with no shared memory the occupancy is register-limited at 100%.
-constexpr int THREADS_PER_BLOCK = 128;
-constexpr int BLOCKS            = 2880;
+// 256x2560 benched best for the popcount-bound kernel on the 4080 SUPER
+// (bench2.cu); with no shared memory the occupancy is register-limited at 100%.
+constexpr int THREADS_PER_BLOCK = 256;
+constexpr int BLOCKS            = 2560;
 constexpr uint32_t TOTAL_THREADS = static_cast<uint32_t>(THREADS_PER_BLOCK) * BLOCKS;
 
-// Steps 24..ISTOP+1 run unchecked; steps ISTOP..1 carry the prune test.
-constexpr int ISTOP = 10;
-// Pre-seed each launch's best with this count: prunes the cold start. A 2^32
-// range has P(best <= 8) ~ e^-4800 — and compute_range falls back to floor 0
-// if a launch ever reports nothing (tiny lease tails).
+// Steps 24..ISTOP+1 run unchecked; the popcount-bound test sits at ISTOP and
+// steps ISTOP..1 carry the per-step prune test (rarely reached). Swept:
+// 12 beats 10/11/13 at TPB 256.
+constexpr int ISTOP = 12;
+// Pre-seed a report window's FIRST launch with this floor: prunes the cold
+// start. A 2^31 range has P(best <= 8) ~ e^-2400 — and compute_range falls
+// back to floor 0 if that launch reports nothing (tiny lease tails). Later
+// launches in the window carry the window best as their floor instead.
 constexpr int BEST_FLOOR = 8;
 
 // Indices per kernel launch. SHARE build: 2^31 instead of 2^32 (~1% slower on
@@ -251,21 +265,26 @@ __device__ __forceinline__ unsigned int draw_opt(unsigned int& s0, unsigned int&
     return res % (unsigned int)BOUND;
 }
 
-// H-mask screen: steps I..STOP+1, unchecked. Only the hit mask H and the
-// count c are maintained — no array, no memory traffic.
+// H-mask screen, split accumulators: steps I..STOP+1, unchecked, no memory
+// traffic. H collects ALL hits; E collects hits from a FOREIGN step — at step
+// I every draw satisfies j <= I, so "j != I" is just masking out bit I: no
+// compare, no predicate, and no read-H-before-write dependency (both are pure
+// OR accumulators the scheduler can reorder freely). A position is fixed iff
+// its bit was hit ONLY by its own step, i.e. fixed = H & ~E, c = popc(H & ~E).
 template<int I, int STOP>
-struct HSteps {
-    static __device__ __forceinline__ void run(int& c, unsigned int& H, unsigned int& bad,
+struct HESteps {
+    static __device__ __forceinline__ void run(unsigned int& H, unsigned int& E, unsigned int& bad,
             unsigned int& s0, unsigned int& s1, unsigned int& s2, unsigned int& s3) {
         unsigned int j = draw_opt<I + 1>(s0, s1, s2, s3, bad);
-        if (j == (unsigned int)I && !(H & (1u << I))) c++;
-        H |= (1u << j);
-        HSteps<I - 1, STOP>::run(c, H, bad, s0, s1, s2, s3);
+        unsigned int m = 1u << j;
+        H |= m;
+        E |= m & ~(1u << I);
+        HESteps<I - 1, STOP>::run(H, E, bad, s0, s1, s2, s3);
     }
 };
 template<int STOP>
-struct HSteps<STOP, STOP> {
-    static __device__ __forceinline__ void run(int&, unsigned int&, unsigned int&,
+struct HESteps<STOP, STOP> {
+    static __device__ __forceinline__ void run(unsigned int&, unsigned int&, unsigned int&,
             unsigned int&, unsigned int&, unsigned int&, unsigned int&) {}
 };
 
@@ -362,6 +381,7 @@ __global__ void __launch_bounds__(TPB) bogo_range_h(
     const unsigned long long stride = (unsigned long long)gridDim.x * TPB;
     const unsigned long long n = hi - lo;
     const unsigned int* lbsrc = ((const unsigned int*)best_and_tid) + 1;   // high word = count
+    constexpr unsigned int LOWMASK = (1u << (STOP + 1)) - 1u;              // bits 0..STOP
     int lbg = (int)__ldcg(lbsrc);
     unsigned int ctr = 0;
     for (unsigned long long off = tid; off < n; off += stride) {
@@ -369,10 +389,16 @@ __global__ void __launch_bounds__(TPB) bogo_range_h(
         const unsigned long long index = lo + off;
         unsigned int s0, s1, s2, s3;
         seed_expand(index, base_seed, s0, s1, s2, s3);
+        unsigned int H = 0, E = 0, bad = 0;
         int c = 0;
-        unsigned int H = 0, bad = 0;
-        HSteps<24, STOP>::run(c, H, bad, s0, s1, s2, s3);
-        if (c + STOP + 1 > lbg) {                           // can still exceed the best?
+        HESteps<24, STOP>::run(H, E, bad, s0, s1, s2, s3);
+        // Popcount bound: position p <= STOP can still become fixed only if
+        // bit p is UNHIT now, so max final count = popc(H&~E) + popc(~H & LOW)
+        // — disjoint sets, so the whole test is one LOP3 + one POPC. Far
+        // tighter than the old c + STOP + 1: it kills the tail for nearly
+        // every index instead of walking 3-4 more pruned steps per warp.
+        if ((int)__popc((H & ~E) | (~H & LOWMASK)) > lbg) { // can still exceed the best?
+            c = __popc(H & ~E);
             if (HPruned<STOP>::run(c, H, lbg, bad, s0, s1, s2, s3)) {
                 if (!(H & 1u)) c++;                          // position 0 never hit
             }
@@ -402,17 +428,21 @@ static unsigned long long best_floor(int f) {
     return ((unsigned long long)(unsigned int)f << 32) | 0xFFFFFFFFULL;
 }
 
+// floorv: publish only counts > floorv. need_result: the caller has no best
+// yet, so a no-find retries once with floor 0 (the range's true best is then
+// always reported). When the caller already holds winBest and passes it as the
+// floor, "nothing above it" IS the answer — no retry needed, and anything that
+// would improve the report is guaranteed to be published.
 RangeResult compute_range(uint64_t base_seed, uint64_t lo, uint64_t hi,
+                          int floorv, bool need_result,
                           unsigned long long* dev_best, uint8_t* dev_arrays, uint64_t* dev_indices) {
     RangeResult rr;
     rr.count = hi - lo;
 
     const auto t0 = std::chrono::high_resolution_clock::now();
     unsigned long long host_best = 0;
-    // Floored pass; on the (astronomically rare / tiny-tail) no-find, retry once
-    // with floor 0 so the range's true best is always reported.
     for (int floor_try = 0; floor_try < 2; floor_try++) {
-        host_best = best_floor(floor_try == 0 ? BEST_FLOOR : 0);
+        host_best = best_floor(floor_try == 0 ? floorv : 0);
         CUDA_CHECK(cudaMemcpy(dev_best, &host_best, sizeof(host_best), cudaMemcpyHostToDevice));
         bogo_range_h<THREADS_PER_BLOCK, ISTOP><<<BLOCKS, THREADS_PER_BLOCK>>>(
                 base_seed, lo, hi, dev_best, dev_arrays, (unsigned long long*)dev_indices);
@@ -420,6 +450,7 @@ RangeResult compute_range(uint64_t base_seed, uint64_t lo, uint64_t hi,
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(&host_best, dev_best, sizeof(host_best), cudaMemcpyDeviceToHost));
         if ((uint32_t)(host_best & 0xFFFFFFFFULL) != 0xFFFFFFFFu) break;
+        if (!need_result) break;   // no-find above the carried floor is a valid answer
     }
     rr.elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
 
@@ -507,7 +538,13 @@ void worker_thread(int) {
                 }
                 const uint64_t lo = totalDone;
                 const uint64_t hi = std::min<uint64_t>(lo + CHUNK_SIZE, lease.count);
-                RangeResult rr = compute_range(base_seed, lo, hi, dev_best, dev_arrays, dev_indices);
+                // Carry the report-window best into the launch floor: the
+                // kernel then only chases counts that would IMPROVE the report
+                // (bench: +2-4%). The floor must be exactly winBest — anything
+                // higher could silently drop a better find below it.
+                RangeResult rr = compute_range(base_seed, lo, hi,
+                        winBest >= 0 ? winBest : BEST_FLOOR, winBest < 0,
+                        dev_best, dev_arrays, dev_indices);
 
                 totalDone = hi;
                 current_lease_done.store(totalDone, std::memory_order_relaxed);
