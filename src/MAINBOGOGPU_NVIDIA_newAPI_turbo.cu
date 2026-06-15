@@ -133,7 +133,7 @@ constexpr int BEST_FLOOR = 8;
 constexpr uint64_t CHUNK_SIZE = 2147483648ULL;  // 2^31
 constexpr int REPORT_MS = 1000;
 // Stop automatically once the account lifetime reaches this many shuffles (0 = never).
-constexpr uint64_t STOP_AT_LIFETIME = 1000ULL * 1000000000000ULL;  // 1000T
+constexpr uint64_t STOP_AT_LIFETIME = 1000ULL * 100000000000000000ULL;  // 100000000T
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 std::atomic<bool> running{true};
