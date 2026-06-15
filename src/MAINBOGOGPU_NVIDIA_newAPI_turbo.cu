@@ -1,34 +1,42 @@
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  Bogo GPU Worker — NVIDIA / CUDA — NEW lease/range API (v5) — TURBO       ║
 // ║                                                                          ║
-// ║  = FAST worker (branch-and-bound pruning + optimistic draws) PLUS the    ║
-// ║  H-MASK reformulation: the fixed-point count is a function of the        ║
-// ║  j-sequence alone —                                                      ║
+// ║  = branch-and-bound pruning PLUS the H-MASK reformulation: the           ║
+// ║  fixed-point count is a function of the j-sequence alone —               ║
 // ║    fixed at position i (i>=1) <=> j_i == i and no step i' > i hit i      ║
 // ║    fixed at position 0        <=> no step ever hit 0                     ║
 // ║  (value i+1 cannot move before step i; a hit finalizes it elsewhere).    ║
 // ║  So the hot path keeps only a 25-bit hit mask in a register — NO         ║
 // ║  permutation array, NO shared memory, 100% occupancy. The exact array    ║
-// ║  is materialized only on cold paths (publish / redo, local memory).      ║
+// ║  is materialized only on the cold publish path (local memory).           ║
 // ║                                                                          ║
 // ║  PLUS the POPCOUNT BOUND: a position can still become fixed only if its  ║
 // ║  bit is UNHIT, so the prune bound is popc of the unhit low bits instead  ║
 // ║  of "all remaining positions" — the test collapses to one LOP3 + POPC,   ║
-// ║  prunes nearly every index right after the screen (12 draws instead of   ║
-// ║  14 + a 3-4 step pruned tail), and the screen itself splits into two     ║
-// ║  pure OR-accumulators (H = all hits, E = foreign hits; fixed = H & ~E)   ║
-// ║  with no compare and no H-read dependency per draw. The report-window    ║
-// ║  best is carried into each launch's floor (publish only what would       ║
-// ║  improve the report).                                                    ║
+// ║  prunes nearly every index right after the screen (11 draws at ISTOP=13) ║
+// ║  and the screen itself splits into two pure OR-accumulators (H = all     ║
+// ║  hits, E = foreign hits; fixed = H & ~E) with no compare and no H-read   ║
+// ║  dependency per draw. The report-window best is carried into each        ║
+// ║  launch's floor (publish only what would improve the report).            ║
 // ║                                                                          ║
-// ║  Everything stays byte-identical to the official engine: winners are     ║
-// ║  recomputed with the full exact shuffle; only the tie-break among        ║
-// ║  equal-count indices can differ from a full scan.                        ║
+// ║  PLUS (V6, 2026-06-15) straight-line NO-FLAG draws: the hot path skips   ║
+// ║  the per-draw RNG-rejection test entirely; any index whose hot count     ║
+// ║  beats the launch best is re-evaluated on the exact rejection-handling   ║
+// ║  cold path, the SOLE publisher — so every report stays byte-identical to ║
+// ║  the official engine (0 rejected). Only the tie-break among equal-count  ║
+// ║  indices can differ from a full scan (and, ~1e-7 per chunk, a record     ║
+// ║  that hits a rejection is missed — never a wrong report).                ║
 // ║                                                                          ║
-// ║  Measured on RTX 4080 SUPER (bench2.cu): ~65.8 B/s vs 44.4 B/s for the   ║
-// ║  previous turbo kernel and 29.7-30.5 B/s baseline (~2.15x), validated:   ║
-// ║  best-score equality on 3 seeds x 2^30 + 40 sub-ranges, CPU recheck of   ║
-// ║  every reported triple.                                                  ║
+// ║  PLUS (V6) SPLITMIX REUSE: seed_expand sets a=mix(base+(k+1)g),          ║
+// ║  b=mix(base+(k+2)g), so b(k)==a(k+1) — consecutive indices share one     ║
+// ║  SplitMix64. Each thread walks a contiguous block (BLOCK_SIZE) and       ║
+// ║  reuses last index's b as this index's a, so each index costs ONE mix    ║
+// ║  not two; the mix xor-shifts are on the ALU bottleneck, so halving them  ║
+// ║  is a direct win. Plus the production-floor STOP re-sweep (13, not 12).  ║
+// ║                                                                          ║
+// ║  Measured on RTX 4080 SUPER (bench, production floor 13): ~82 B/s vs     ║
+// ║  ~66 for turbo v2 on the same machine (+24%), validated: best-score      ║
+// ║  equality on 3 seeds x 2^30 + 40 sub-ranges, CPU recheck of every triple.║
 // ║                                                                          ║
 // ║  Credentials come from environment variables (nothing hardcoded):        ║
 // ║    set BOGO_UUID=...   set BOGO_NICKNAME=...   set BOGO_CODE=...          ║
@@ -118,9 +126,18 @@ constexpr int BLOCKS            = 2560;
 constexpr uint32_t TOTAL_THREADS = static_cast<uint32_t>(THREADS_PER_BLOCK) * BLOCKS;
 
 // Steps 24..ISTOP+1 run unchecked; the popcount-bound test sits at ISTOP and
-// steps ISTOP..1 carry the per-step prune test (rarely reached). Swept:
-// 12 beats 10/11/13 at TPB 256.
-constexpr int ISTOP = 12;
+// steps ISTOP..1 carry the per-step prune test (rarely reached). Swept at the
+// PRODUCTION floor (the worker carries winBest ~13 into the launch floor, not
+// the bench's pessimistic 8): with the straight-line draws the tail almost
+// never fires, so one fewer mandatory screen draw wins — STOP=13 beats 12/14
+// across floors 12-15 (STOP=14 is faster at f14+ but collapses at f12, too
+// floor-sensitive for a fixed kernel). See docs/OPTIMIZATIONS, 2026-06-15.
+constexpr int ISTOP = 13;
+// SplitMix reuse: each thread walks a contiguous block of BLOCK_SIZE indices so
+// consecutive indices share one SplitMix64 (b(k) == a(k+1)). 512 benched best
+// (256..1024 swept; >=512 amortizes the per-block first-index double-mix, <512
+// loses to per-block overhead). Must stay > a few so the reuse pays off.
+constexpr int BLOCK_SIZE = 512;
 // Pre-seed a report window's FIRST launch with this floor: prunes the cold
 // start. A 2^31 range has P(best <= 8) ~ e^-2400 — and compute_range falls
 // back to floor 0 if that launch reports nothing (tiny lease tails). Later
@@ -134,6 +151,9 @@ constexpr uint64_t CHUNK_SIZE = 2147483648ULL;  // 2^31
 constexpr int REPORT_MS = 1000;
 // Stop automatically once the account lifetime reaches this many shuffles (0 = never).
 constexpr uint64_t STOP_AT_LIFETIME = 1000ULL * 100000000000000000ULL;  // 100000000T
+// Worker release version shown in the GUI/banner (kernel: no-flag draws + STOP=13
+// + SplitMix reuse). Distinct from the lease/range protocol version (v5).
+constexpr const char* WORKER_VERSION = "V6";
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 std::atomic<bool> running{true};
@@ -229,39 +249,41 @@ __device__ __forceinline__ void seed_expand(unsigned long long index, unsigned l
     if ((s0|s1|s2|s3)==0u) s0=1u;
 }
 
-// One Fisher-Yates draw for compile-time BOUND: threshold and modulus are
-// constants (modulus -> multiply-shift, power-of-two -> AND). Byte-identical
-// rejection sequence.
-template<int BOUND>
-__device__ __forceinline__ unsigned int draw_j(unsigned int& s0, unsigned int& s1,
-                                               unsigned int& s2, unsigned int& s3) {
-    constexpr unsigned int TH = (unsigned int)(0x100000000ULL % (unsigned long long)BOUND);
-    for (;;) {
-        unsigned int sum = s0 + s3;
-        unsigned int res = ((sum << 7) | (sum >> 25)) + s0;
-        unsigned int t = s1 << 9;
-        s2 ^= s0; s3 ^= s1; s1 ^= s2; s0 ^= s3; s2 ^= t;
-        s3 = (s3 << 11) | (s3 >> 21);
-        if (TH == 0u || res >= TH) return res % (unsigned int)BOUND;
-    }
+// SplitMix64 mix of (base + m*golden) — bit-identical to the a/b that
+// seed_expand derives. seed_expand(k) sets a = sm_at(base,k+1), b = sm_at(base,k+2),
+// so b(k) == a(k+1): two CONSECUTIVE indices share one SplitMix64. The kernel
+// walks a contiguous block of indices and reuses last step's b as this step's a,
+// so each index after the first costs only ONE mix() instead of two — the mix
+// xor-shifts are on the ALU pipe (the bottleneck), so halving them is a direct
+// win (+~10% at the production floor; see docs/OPTIMIZATIONS 2026-06-15 round 2).
+__device__ __forceinline__ unsigned long long sm_at(unsigned long long base, unsigned long long m) {
+    unsigned long long x = base + m * 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    x = x ^ (x >> 31);
+    return x;
 }
 
-// OPTIMISTIC draw: no rejection loop. A draw is rejected with P = TH/2^32
-// (TH <= 24, ~once per ~18M indices); the hot path assumes no rejection and
-// only flags one into `bad`. If bad != 0 the whole index is recomputed on the
-// cold exact path, so results stay byte-identical. Straight-line draws remove
-// the per-step BRA/BSSY/BSYNC overhead and let ptxas schedule across steps
-// (~+8% on the 4080 SUPER, found via SASS audit).
+// STRAIGHT-LINE draw (no-flag): one xoshiro128++ step, modulus is a compile-time
+// constant (-> multiply-shift; power-of-two -> AND). The official engine rejects
+// res < TH (P = TH/2^32, TH <= 24, ~once per ~18M indices) and redraws; the hot
+// path skips that test entirely. A would-be rejection therefore only diverges
+// the count of THAT index, which is harmless: every index whose hot count could
+// beat the launch best is fully re-evaluated on the exact cold path (the proper
+// rejection-handling loop in exact_redo_l), so PUBLISHED reports stay byte-identical
+// (0 rejected). Dropping the per-draw `res<TH` test removes a loop-carried OR
+// dependency and lets ptxas schedule freely across the screen (+7% measured;
+// see docs/OPTIMIZATIONS for the 2026-06-15 round). The only theoretical cost is
+// missing a record when a rejection lands inside that exact record's draws —
+// ~1e-7 per chunk, and never a wrong report.
 template<int BOUND>
-__device__ __forceinline__ unsigned int draw_opt(unsigned int& s0, unsigned int& s1,
-        unsigned int& s2, unsigned int& s3, unsigned int& bad) {
-    constexpr unsigned int TH = (unsigned int)(0x100000000ULL % (unsigned long long)BOUND);
+__device__ __forceinline__ unsigned int draw_nf(unsigned int& s0, unsigned int& s1,
+        unsigned int& s2, unsigned int& s3) {
     unsigned int sum = s0 + s3;
     unsigned int res = ((sum << 7) | (sum >> 25)) + s0;
     unsigned int t = s1 << 9;
     s2 ^= s0; s3 ^= s1; s1 ^= s2; s0 ^= s3; s2 ^= t;
     s3 = (s3 << 11) | (s3 >> 21);
-    if (TH != 0u) bad |= (unsigned int)(res < TH);
     return res % (unsigned int)BOUND;
 }
 
@@ -273,72 +295,49 @@ __device__ __forceinline__ unsigned int draw_opt(unsigned int& s0, unsigned int&
 // its bit was hit ONLY by its own step, i.e. fixed = H & ~E, c = popc(H & ~E).
 template<int I, int STOP>
 struct HESteps {
-    static __device__ __forceinline__ void run(unsigned int& H, unsigned int& E, unsigned int& bad,
+    static __device__ __forceinline__ void run(unsigned int& H, unsigned int& E,
             unsigned int& s0, unsigned int& s1, unsigned int& s2, unsigned int& s3) {
-        unsigned int j = draw_opt<I + 1>(s0, s1, s2, s3, bad);
+        unsigned int j = draw_nf<I + 1>(s0, s1, s2, s3);
         unsigned int m = 1u << j;
         H |= m;
         E |= m & ~(1u << I);
-        HESteps<I - 1, STOP>::run(H, E, bad, s0, s1, s2, s3);
+        HESteps<I - 1, STOP>::run(H, E, s0, s1, s2, s3);
     }
 };
 template<int STOP>
 struct HESteps<STOP, STOP> {
-    static __device__ __forceinline__ void run(unsigned int&, unsigned int&, unsigned int&,
+    static __device__ __forceinline__ void run(unsigned int&, unsigned int&,
             unsigned int&, unsigned int&, unsigned int&, unsigned int&) {}
 };
 
 // H-mask pruned tail: steps I..1, each guarded by the branch-and-bound test.
 template<int I>
 struct HPruned {
-    static __device__ __forceinline__ bool run(int& c, unsigned int& H, int lbg, unsigned int& bad,
+    static __device__ __forceinline__ bool run(int& c, unsigned int& H, int lbg,
             unsigned int& s0, unsigned int& s1, unsigned int& s2, unsigned int& s3) {
         if (c + I + 1 <= lbg) return false;        // cannot exceed launch best
-        unsigned int j = draw_opt<I + 1>(s0, s1, s2, s3, bad);
+        unsigned int j = draw_nf<I + 1>(s0, s1, s2, s3);
         if (j == (unsigned int)I && !(H & (1u << I))) c++;
         H |= (1u << j);
-        return HPruned<I - 1>::run(c, H, lbg, bad, s0, s1, s2, s3);
+        return HPruned<I - 1>::run(c, H, lbg, s0, s1, s2, s3);
     }
 };
 template<>
 struct HPruned<0> {
-    static __device__ __forceinline__ bool run(int&, unsigned int&, int, unsigned int&,
+    static __device__ __forceinline__ bool run(int&, unsigned int&, int,
             unsigned int&, unsigned int&, unsigned int&, unsigned int&) { return true; }
 };
 
-// Cold path: recompute the winner's exact permutation in LOCAL memory (the hot
-// path has no array at all), publish it, bump the launch best.
-__device__ __noinline__ int publish_l(unsigned long long index, unsigned long long base_seed, int c,
-        unsigned int tid, unsigned long long* best_and_tid,
-        unsigned char* all_arrays, unsigned long long* all_idx) {
-    unsigned int s0, s1, s2, s3;
-    seed_expand(index, base_seed, s0, s1, s2, s3);
-    unsigned int arr[25];
-    for (int t = 0; t < 25; t++) arr[t] = (unsigned int)(t + 1);
-    for (int i = 24; i > 0; i--) {
-        unsigned int bound = (unsigned int)(i + 1);
-        unsigned int th = (unsigned int)(0x100000000ULL % (unsigned long long)bound);
-        unsigned int j;
-        for (;;) {
-            unsigned int sum = s0 + s3;
-            unsigned int res = ((sum << 7) | (sum >> 25)) + s0;
-            unsigned int t = s1 << 9;
-            s2 ^= s0; s3 ^= s1; s1 ^= s2; s0 ^= s3; s2 ^= t;
-            s3 = (s3 << 11) | (s3 >> 21);
-            if (res >= th) { j = res % bound; break; }
-        }
-        unsigned int tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
-    }
-    for (int t = 0; t < 25; t++) all_arrays[(unsigned long long)tid * 25ULL + t] = (unsigned char)arr[t];
-    all_idx[tid] = index;
-    unsigned long long old = atomicMax(best_and_tid,
-        ((unsigned long long)(unsigned int)c << 32) | (unsigned long long)tid);
-    int oldc = (int)(unsigned int)(old >> 32);
-    return c > oldc ? c : oldc;
-}
-
-// Cold exact path: full loop-based evaluation of one index (handles RNG
-// rejections properly), publishes if it improves. Runs ~once per 18M indices.
+// Cold exact path: the SOLE publisher. Re-evaluates one candidate index with
+// the full rejection-handling shuffle (so RNG rejections are honoured exactly),
+// counts fixed points from the materialized permutation, and publishes the
+// triple iff it still beats the launch best. Because every report originates
+// here, published (index, permutation, count) triples are byte-identical to the
+// official engine and the server accepts all of them (0 rejected). The hot path
+// only decides WHICH indices reach this function; it never publishes directly.
+// Reached only when an index's hot count exceeds the launch best — rare at the
+// carried winBest floor (~13), so the local-memory array here costs nothing on
+// the hot path (100% occupancy, no shared memory).
 __device__ __noinline__ int exact_redo_l(unsigned long long index, unsigned long long base_seed,
         int lbg, unsigned int tid, unsigned long long* best_and_tid,
         unsigned char* all_arrays, unsigned long long* all_idx) {
@@ -373,43 +372,56 @@ __device__ __noinline__ int exact_redo_l(unsigned long long index, unsigned long
     return lbg;
 }
 
-template<int TPB, int STOP>
+// Each thread walks a contiguous block of B indices (grid-stride OVER blocks)
+// so it can reuse one SplitMix64 between consecutive indices (b(k)==a(k+1)):
+// sm_a holds a(index) = b(index-1), and only sm_b = b(index) is freshly mixed.
+template<int TPB, int STOP, int B>
 __global__ void __launch_bounds__(TPB) bogo_range_h(
     unsigned long long base_seed, unsigned long long lo, unsigned long long hi,
     unsigned long long* best_and_tid, unsigned char* all_arrays, unsigned long long* all_idx) {
     const unsigned int tid = blockIdx.x * TPB + threadIdx.x;
-    const unsigned long long stride = (unsigned long long)gridDim.x * TPB;
-    const unsigned long long n = hi - lo;
+    const unsigned long long nthreads = (unsigned long long)gridDim.x * TPB;
     const unsigned int* lbsrc = ((const unsigned int*)best_and_tid) + 1;   // high word = count
     constexpr unsigned int LOWMASK = (1u << (STOP + 1)) - 1u;              // bits 0..STOP
+    constexpr unsigned long long G = 0x9E3779B97F4A7C15ULL;
     int lbg = (int)__ldcg(lbsrc);
     unsigned int ctr = 0;
-    for (unsigned long long off = tid; off < n; off += stride) {
-        if ((ctr++ & 7u) == 0u) lbg = (int)__ldcg(lbsrc);   // stale-low is safe
-        const unsigned long long index = lo + off;
-        unsigned int s0, s1, s2, s3;
-        seed_expand(index, base_seed, s0, s1, s2, s3);
-        unsigned int H = 0, E = 0, bad = 0;
-        int c = 0;
-        HESteps<24, STOP>::run(H, E, bad, s0, s1, s2, s3);
-        // Popcount bound: position p <= STOP can still become fixed only if
-        // bit p is UNHIT now, so max final count = popc(H&~E) + popc(~H & LOW)
-        // — disjoint sets, so the whole test is one LOP3 + one POPC. Far
-        // tighter than the old c + STOP + 1: it kills the tail for nearly
-        // every index instead of walking 3-4 more pruned steps per warp.
-        if ((int)__popc((H & ~E) | (~H & LOWMASK)) > lbg) { // can still exceed the best?
-            c = __popc(H & ~E);
-            if (HPruned<STOP>::run(c, H, lbg, bad, s0, s1, s2, s3)) {
-                if (!(H & 1u)) c++;                          // position 0 never hit
+    const unsigned long long blockStride = nthreads * (unsigned long long)B;
+    for (unsigned long long bstart = lo + (unsigned long long)tid * B; bstart < hi; bstart += blockStride) {
+        unsigned long long sm_a = sm_at(base_seed, bstart + 1);   // a(bstart)
+        unsigned long long end = bstart + B; if (end > hi) end = hi;
+        for (unsigned long long index = bstart; index < end; index++) {
+            if ((ctr++ & 7u) == 0u) lbg = (int)__ldcg(lbsrc);   // stale-low is safe
+            // sm_b = b(index) = mix(base + (index+2)*g); sm_a = a(index) reused.
+            unsigned long long xb = base_seed + (index + 2) * G;
+            xb = (xb ^ (xb >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            xb = (xb ^ (xb >> 27)) * 0x94D049BB133111EBULL;
+            xb = xb ^ (xb >> 31);
+            unsigned int s0 = (unsigned int)sm_a, s1 = (unsigned int)(sm_a >> 32);
+            unsigned int s2 = (unsigned int)xb,   s3 = (unsigned int)(xb >> 32);
+            if ((s0 | s1 | s2 | s3) == 0u) s0 = 1u;
+            sm_a = xb;                                          // a(index+1) = b(index)
+            unsigned int H = 0, E = 0;
+            int c = 0;
+            HESteps<24, STOP>::run(H, E, s0, s1, s2, s3);
+            // Popcount bound: position p <= STOP can still become fixed only if
+            // bit p is UNHIT now, so max final count = popc(H&~E) + popc(~H & LOW)
+            // — disjoint sets, so the whole test is one LOP3 + one POPC. Far
+            // tighter than the old c + STOP + 1: it kills the tail for nearly
+            // every index instead of walking 3-4 more pruned steps per warp.
+            if ((int)__popc((H & ~E) | (~H & LOWMASK)) > lbg) { // can still exceed the best?
+                c = __popc(H & ~E);
+                if (HPruned<STOP>::run(c, H, lbg, s0, s1, s2, s3)) {
+                    if (!(H & 1u)) c++;                          // position 0 never hit
+                }
+                // Every candidate that beats the launch best is re-evaluated on
+                // the exact (rejection-handling) cold path, the only publisher —
+                // so reports stay byte-identical even though the hot draws above
+                // skipped the rejection test.
+                if (c > lbg)
+                    lbg = exact_redo_l(index, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
             }
         }
-        // A flagged rejection invalidates c and every decision made from it ->
-        // recompute the index exactly. Otherwise the executed prefix is
-        // byte-exact (rejections can only hide in steps we never drew).
-        if (bad)
-            lbg = exact_redo_l(index, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
-        else if (c > lbg)
-            lbg = publish_l(index, base_seed, c, tid, best_and_tid, all_arrays, all_idx);
     }
 }
 
@@ -444,7 +456,7 @@ RangeResult compute_range(uint64_t base_seed, uint64_t lo, uint64_t hi,
     for (int floor_try = 0; floor_try < 2; floor_try++) {
         host_best = best_floor(floor_try == 0 ? floorv : 0);
         CUDA_CHECK(cudaMemcpy(dev_best, &host_best, sizeof(host_best), cudaMemcpyHostToDevice));
-        bogo_range_h<THREADS_PER_BLOCK, ISTOP><<<BLOCKS, THREADS_PER_BLOCK>>>(
+        bogo_range_h<THREADS_PER_BLOCK, ISTOP, BLOCK_SIZE><<<BLOCKS, THREADS_PER_BLOCK>>>(
                 base_seed, lo, hi, dev_best, dev_arrays, (unsigned long long*)dev_indices);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -717,7 +729,7 @@ void dashboard_thread() {
         { std::lock_guard<std::mutex> l(statusMutex); status = statusLine; server = lastServerMessage; }
         if (server.size() > 80) server.resize(80);
         std::cout << "\x1b[H";
-        std::cout << "=== BOGOSORT CUDA WORKER (new API / v5, TURBO h-mask) ===\n";
+        std::cout << "=== BOGOSORT CUDA WORKER " << WORKER_VERSION << " (lease API v5, TURBO h-mask) ===\n";
         std::cout << "Name:        " << NICKNAME << "\n";
         std::cout << "WebSocket:   " << (ws_open.load() ? "open" : "closed") << "\n";
         std::cout << "Kernel rate: " << rate_string(gpu_rate.load()) << "          \n";
@@ -768,11 +780,11 @@ int main(int argc, char** argv) {
     }
 
     ix::initNetSystem();
-    std::cout << "Bogo CUDA worker (new lease/range API, v5, TURBO h-mask kernel)\n"
+    std::cout << "Bogo CUDA worker " << WORKER_VERSION << " (lease/range API v5, TURBO h-mask kernel)\n"
               << "Target: " << WS_URL << "\nNickname: " << NICKNAME << "\n"
               << "GPU launch: " << BLOCKS << " x " << THREADS_PER_BLOCK
               << " = " << comma_u64(TOTAL_THREADS) << " threads, chunk " << comma_u64(CHUNK_SIZE)
-              << ", screen-stop " << ISTOP << ", floor " << BEST_FLOOR << "\n";
+              << ", screen-stop " << ISTOP << ", block " << BLOCK_SIZE << ", floor " << BEST_FLOOR << "\n";
 
     std::vector<std::thread> workers, senders;
     for (int i = 0; i < NUM_WORKERS; ++i) workers.emplace_back(worker_thread, i);

@@ -735,6 +735,139 @@ __global__ void __launch_bounds__(TPB) perf_hp(
     }
 }
 
+// ───────── H-mask + POPCOUNT BOUND + NO-FLAG draws (shipped 2026-06-15) ──────
+// perf_hp_nf is perf_hp with the per-draw RNG-rejection test removed from the
+// hot path entirely: draws run straight-line (draw_nf), and ANY index whose hot
+// count beats the launch best is re-evaluated on the exact rejection-handling
+// cold path (exact_redo_l), the sole publisher — so reports stay byte-identical
+// (0 rejected). Dropping the loop-carried `bad` OR lets ptxas schedule across
+// the screen (+7%); combined with the production-floor STOP re-sweep (13, not 12
+// — the worker carries winBest~13 into the floor, where one fewer mandatory
+// screen draw wins) it is the shipped turbo kernel. bogo_range_h in the worker
+// is identical to this; validating perf_hp_nf<256,13> validates the worker.
+template<int BOUND>
+__device__ __forceinline__ unsigned int draw_nf(unsigned int& s0, unsigned int& s1,
+        unsigned int& s2, unsigned int& s3) {
+    unsigned int sum = s0 + s3;
+    unsigned int res = ((sum << 7) | (sum >> 25)) + s0;
+    unsigned int t = s1 << 9;
+    s2 ^= s0; s3 ^= s1; s1 ^= s2; s0 ^= s3; s2 ^= t;
+    s3 = (s3 << 11) | (s3 >> 21);
+    return res % (unsigned int)BOUND;
+}
+template<int I, int STOP>
+struct HESteps_nf {
+    static __device__ __forceinline__ void run(unsigned int& H, unsigned int& E,
+            unsigned int& s0, unsigned int& s1, unsigned int& s2, unsigned int& s3) {
+        unsigned int j = draw_nf<I + 1>(s0, s1, s2, s3);
+        unsigned int m = 1u << j;
+        H |= m;
+        E |= m & ~(1u << I);
+        HESteps_nf<I - 1, STOP>::run(H, E, s0, s1, s2, s3);
+    }
+};
+template<int STOP>
+struct HESteps_nf<STOP, STOP> {
+    static __device__ __forceinline__ void run(unsigned int&, unsigned int&,
+            unsigned int&, unsigned int&, unsigned int&, unsigned int&) {}
+};
+template<int I>
+struct HPruned_nf {
+    static __device__ __forceinline__ bool run(int& c, unsigned int& H, int lbg,
+            unsigned int& s0, unsigned int& s1, unsigned int& s2, unsigned int& s3) {
+        if (c + I + 1 <= lbg) return false;
+        unsigned int j = draw_nf<I + 1>(s0, s1, s2, s3);
+        if (j == (unsigned int)I && !(H & (1u << I))) c++;
+        H |= (1u << j);
+        return HPruned_nf<I - 1>::run(c, H, lbg, s0, s1, s2, s3);
+    }
+};
+template<>
+struct HPruned_nf<0> {
+    static __device__ __forceinline__ bool run(int&, unsigned int&, int,
+            unsigned int&, unsigned int&, unsigned int&, unsigned int&) { return true; }
+};
+template<int TPB, int STOP>
+__global__ void __launch_bounds__(TPB) perf_hp_nf(
+    unsigned long long base_seed, unsigned long long lo, unsigned long long hi,
+    unsigned long long* best_and_tid, unsigned char* all_arrays, unsigned long long* all_idx) {
+    const unsigned int tid = blockIdx.x * TPB + threadIdx.x;
+    const unsigned long long stride = (unsigned long long)gridDim.x * TPB;
+    const unsigned long long n = hi - lo;
+    const unsigned int* lbsrc = ((const unsigned int*)best_and_tid) + 1;
+    constexpr unsigned int LOWMASK = (1u << (STOP + 1)) - 1u;
+    int lbg = (int)__ldcg(lbsrc);
+    unsigned int ctr = 0;
+    for (unsigned long long off = tid; off < n; off += stride) {
+        if ((ctr++ & 7u) == 0u) lbg = (int)__ldcg(lbsrc);
+        const unsigned long long index = lo + off;
+        unsigned int s0, s1, s2, s3;
+        seed_expand(index, base_seed, s0, s1, s2, s3);
+        unsigned int H = 0, E = 0;
+        int c = 0;
+        HESteps_nf<24, STOP>::run(H, E, s0, s1, s2, s3);
+        if ((int)__popc((H & ~E) | (~H & LOWMASK)) > lbg) {
+            c = __popc(H & ~E);
+            if (HPruned_nf<STOP>::run(c, H, lbg, s0, s1, s2, s3)) {
+                if (!(H & 1u)) c++;
+            }
+            if (c > lbg)
+                lbg = exact_redo_l(index, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
+        }
+    }
+}
+
+// ───────── V6 (2026-06-15): no-flag + STOP=13 + SPLITMIX REUSE ───────────────
+// seed_expand(k) sets a=mix(base+(k+1)*g), b=mix(base+(k+2)*g), so b(k)==a(k+1):
+// consecutive indices share one SplitMix64. A thread walks a contiguous block of
+// B indices (grid-stride OVER blocks) and reuses last index's b as this index's
+// a — each index costs ONE mix() not two; the mix xor-shifts are on the ALU
+// bottleneck, so halving them is +~10% at the production floor. bogo_range_h in
+// the worker is identical; validating perf_hp_nf_reuse<256,13,512> validates it.
+__device__ __forceinline__ unsigned long long sm_at(unsigned long long base, unsigned long long m) {
+    unsigned long long x = base + m * 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    x = x ^ (x >> 31);
+    return x;
+}
+template<int TPB, int STOP, int B>
+__global__ void __launch_bounds__(TPB) perf_hp_nf_reuse(
+    unsigned long long base_seed, unsigned long long lo, unsigned long long hi,
+    unsigned long long* best_and_tid, unsigned char* all_arrays, unsigned long long* all_idx) {
+    const unsigned int tid = blockIdx.x * TPB + threadIdx.x;
+    const unsigned long long nthreads = (unsigned long long)gridDim.x * TPB;
+    const unsigned int* lbsrc = ((const unsigned int*)best_and_tid) + 1;
+    constexpr unsigned int LOWMASK = (1u << (STOP + 1)) - 1u;
+    constexpr unsigned long long G = 0x9E3779B97F4A7C15ULL;
+    int lbg = (int)__ldcg(lbsrc);
+    unsigned int ctr = 0;
+    const unsigned long long blockStride = nthreads * (unsigned long long)B;
+    for (unsigned long long bstart = lo + (unsigned long long)tid * B; bstart < hi; bstart += blockStride) {
+        unsigned long long sm_a = sm_at(base_seed, bstart + 1);
+        unsigned long long end = bstart + B; if (end > hi) end = hi;
+        for (unsigned long long index = bstart; index < end; index++) {
+            if ((ctr++ & 7u) == 0u) lbg = (int)__ldcg(lbsrc);
+            unsigned long long xb = base_seed + (index + 2) * G;
+            xb = (xb ^ (xb >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            xb = (xb ^ (xb >> 27)) * 0x94D049BB133111EBULL;
+            xb = xb ^ (xb >> 31);
+            unsigned int s0 = (unsigned int)sm_a, s1 = (unsigned int)(sm_a >> 32);
+            unsigned int s2 = (unsigned int)xb,   s3 = (unsigned int)(xb >> 32);
+            if ((s0 | s1 | s2 | s3) == 0u) s0 = 1u;
+            sm_a = xb;
+            unsigned int H = 0, E = 0; int c = 0;
+            HESteps_nf<24, STOP>::run(H, E, s0, s1, s2, s3);
+            if ((int)__popc((H & ~E) | (~H & LOWMASK)) > lbg) {
+                c = __popc(H & ~E);
+                if (HPruned_nf<STOP>::run(c, H, lbg, s0, s1, s2, s3)) { if (!(H & 1u)) c++; }
+                if (c > lbg)
+                    lbg = exact_redo_l(index, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
+            }
+        }
+    }
+}
+
 // FIRSTC: step 24 runs on a fresh array, so vi = arr[24] = 25 is known without
 // loading. SPARSE: use the even-I-only bound tests in the tail.
 template<int TPB, int ISTOP, bool FIRSTC = false, bool SPARSE = false>
@@ -989,12 +1122,12 @@ int main(int argc, char** argv) {
         const uint64_t S = 0x123456789ABCDEFULL;
         printf("Merim ~15 s...\n");
         double rb = bench(perf_base, S, dp, 4.0, 1920, 192, 0ULL);
-        double rp = bench((PerfFn)perf_pruned<192, 10, unsigned int, 8, false>, S, dp, 4.0, 1920, 192, pfloor(8));
-        double rh = bench((PerfFn)perf_hp<256, 12>, S, dp, 4.0, 2560, 256, pfloor(8), 0);
+        double rh2 = bench((PerfFn)perf_hp<256, 12>, S, dp, 4.0, 2560, 256, pfloor(13), 0);
+        double rh = bench((PerfFn)perf_hp_nf_reuse<256, 13, 512>, S, dp, 4.0, 2560, 256, pfloor(13), 0);
         printf("\n  puvodni kernel : %6.2f B/s   (cisty stav ~29.7, pomaly stav ~21)\n", rb/1e9);
-        printf("  fast kernel    : %6.2f B/s   (cisty stav ~40)\n", rp/1e9);
-        printf("  turbo v2 kernel: %6.2f B/s   (cisty stav ~65)\n", rh/1e9);
-        printf("  pomer          : %5.2fx\n\n", rh/rb);
+        printf("  turbo v2 kernel: %6.2f B/s   (cisty stav ~66 @ floor 13)\n", rh2/1e9);
+        printf("  turbo V6 kernel: %6.2f B/s   (cisty stav ~82 @ floor 13, shipped)\n", rh/1e9);
+        printf("  pomer V6/base  : %5.2fx   (V6/v2 %4.2fx)\n\n", rh/rb, rh/rh2);
         if (rb >= 26e9)      printf("STAV: CISTY - GPU jede naplno, nic ho nebrzdi.\n");
         else if (rb >= 23e9) printf("STAV: MEZISTAV - neco na GPU lehce saha (prohlizec/overlay?).\n");
         else                 printf("STAV: POMALY - jina aplikace aktivne pouziva GPU. Spust gpu_who.ps1.\n");
@@ -1066,13 +1199,12 @@ int main(int argc, char** argv) {
     #define MKHA(T, S) PV{ "ha<" #T "," #S ">", (PerfFn)perf_ha<T, S>, T, S, 0 }
     #define MKHQ(T, S) PV{ "hq<" #T "," #S ">", (PerfFn)perf_hq<T, S>, T, S, 0 }
     #define MKHP(T, S) PV{ "hp<" #T "," #S ">", (PerfFn)perf_hp<T, S>, T, S, 0 }
+    #define MKNF(T, S) PV{ "hp_nf<" #T "," #S ">", (PerfFn)perf_hp_nf<T, S>, T, S, 0 }
+    #define MKRU(T, S, B) PV{ "reuse<" #T "," #S ",B" #B ">", (PerfFn)perf_hp_nf_reuse<T, S, B>, T, S, 0 }
     std::vector<PV> pvs = {
-        MKH(128, 10),                    // turbo v1 kernel (historical anchor)
-        MKHQ(128, 10),                   // v1 + popcount bound only
-        MKHP(128, 12),                   // + H/E split screen
-        MKHP(96, 12),                    // shape sweep (STOP 10..13 and larger
-        MKHP(192, 12),                   //   TPB swept 2026-06-13; 256x12 won)
-        MKHP(256, 12),                   // shipped turbo v2 kernel
+        MKHP(256, 12),                   // turbo v2 kernel (anchor)
+        MKNF(256, 13),                   // v3: no-flag straight-line draws, STOP 13
+        MKRU(256, 13, 512),              // shipped V6 kernel (+ SplitMix reuse)
     };
 
     printf("%-24s %5s %5s %10s %9s   %-6s %-8s %-5s\n",
@@ -1107,34 +1239,29 @@ int main(int argc, char** argv) {
     const PV& w = pvs[bestIdx];
     printf("\nWINNER: %s -> %.3f B/s (%.3fx)\n", w.name, bestRate/1e9, bestRate/base_rate);
 
-    // Blocks sweep for the winner.
-    printf("\nblocks sweep (%s):\n  ", w.name);
-    int swBest = 0; double swBestRate = 0;
-    for (int bl : {960, 1280, 1920, 2560, 3840, 5120}) {
-        if ((uint64_t)bl * w.tpb > MAXT) { printf("%6s ", "-"); continue; }
-        double r = bench(w.fn, SEEDS[0], d, 1.5, bl, w.tpb, pfloor(8), w.elemB);
-        printf("%d:%.1f  ", bl, r/1e9);
-        if (r > swBestRate) { swBestRate = r; swBest = bl; }
+    (void)w;
+    // ── Production-config head-to-head (the number that maps to the live
+    // server rate). The validation table above runs floor 8, where the screen
+    // depth is the old optimum (STOP 12); the worker carries the report-window
+    // best (~13) into each launch's floor, and at that floor the tail almost
+    // never fires so a shorter screen (STOP 13) wins. This is why the SHIPPED
+    // kernel is hp_nf<256,13> even though the floor-8 table prefers STOP 12.
+    struct Fin { const char* name; PerfFn fn; };
+    std::vector<Fin> fins = {
+        { "hp    <256,12> (v2)     ", (PerfFn)perf_hp<256,12> },
+        { "nf    <256,13> (v3)     ", (PerfFn)perf_hp_nf<256,13> },
+        { "reuse <256,13,B512> SHIP", (PerfFn)perf_hp_nf_reuse<256,13,512> },
+    };
+    printf("\n=== production-config head-to-head (blocks=2560, chunk=2^31) ===\n");
+    printf("%-24s %9s %9s %9s %9s\n", "kernel", "f8", "f12", "f13", "f14");
+    for (auto& fdef : fins) {
+        printf("%-24s", fdef.name);
+        for (int f : {8, 12, 13, 14}) {
+            double r = bench(fdef.fn, SEEDS[0], d, 2.0, 2560, 256, pfloor(f), 0, 1ull<<31);
+            printf(" %8.2f", r/1e9);
+        }
+        printf("\n");
     }
-    printf("\n  best blocks=%d -> %.3f B/s (%.3fx)\n", swBest, swBestRate/1e9, swBestRate/base_rate);
-
-    // Chunk-size sweep for the winner (per-launch reset amortization).
-    printf("\nchunk sweep (%s, blocks=%d):\n  ", w.name, swBest);
-    for (uint64_t ch : {1ull<<30, 1ull<<31, 1ull<<32}) {
-        double r = bench(w.fn, SEEDS[0], d, 2.0, swBest, w.tpb, pfloor(8), w.elemB, ch);
-        int lg = 0; for (uint64_t x = ch; x > 1; x >>= 1) lg++;
-        printf("2^%d:%.2f  ", lg, r/1e9);
-    }
-    printf("\n");
-
-    // Floor sweep: what carrying the report-window best into the launch floor
-    // buys (the worker can seed the floor with winBest instead of 8).
-    printf("\nfloor sweep (%s, blocks=%d):\n  ", w.name, swBest);
-    for (int f : {8, 10, 12, 13}) {
-        double r = bench(w.fn, SEEDS[0], d, 1.5, swBest, w.tpb, pfloor(f), w.elemB);
-        printf("f%d:%.2f  ", f, r/1e9);
-    }
-    printf("\n");
 
     cudaFree(d.best); cudaFree(d.arrays); cudaFree(d.indices);
     return 0;

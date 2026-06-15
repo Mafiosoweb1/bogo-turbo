@@ -1,6 +1,62 @@
-# bogo_gpu_turbo / bogo_gpu_fast — optimalizované workery (2026-06-10, popcount bound 2026-06-13)
+# bogo_gpu_turbo / bogo_gpu_fast — optimalizované workery (2026-06-10, popcount bound 2026-06-13, V6: no-flag + STOP@floor + SplitMix reuse 2026-06-15)
 
-## TURBO v2 ✅ ~2.3× — popcount bound, server naměřil ~68 B/s (doporučený default)
+## TURBO V6 ✅ — SplitMix reuse + no-flag tahy + STOP@floor, server +26 % proti v2
+
+`MAINBOGOGPU_NVIDIA_newAPI_turbo.cu` (kernel `bogo_range_h<256,13,512>`). Tři
+kroky nad v2, všechny ověřené stejnou validační sadou (3 seedy × 2^30 + 40
+podrozsahů + CPU recheck každé trojice) a ostrým serverem (0 rejected):
+
+1. **SplitMix reuse (+~10–15 %, největší).** `seed_expand(k)` počítá
+   `a = mix(base+(k+1)·g)`, `b = mix(base+(k+2)·g)`, takže **`b(k) == a(k+1)`** —
+   dva po sobě jdoucí indexy sdílejí jeden SplitMix64. Vlákno teď prochází
+   **souvislý blok** indexů (grid-stride PŘES bloky, `BLOCK_SIZE=512`) a `b`
+   předchozího indexu použije jako `a` toho dalšího, takže každý index po prvním
+   stojí **jeden mix() místo dvou**. Mix xor-shifty leží na ALU pipe (úzké
+   hrdlo), takže půlení seedu je přímý zisk a platí **na každém floor** (proto je
+   reálný zisk větší než bench na f13). 48 registrů → ~83 % okupance, ale seed
+   úspora to víc než vyrovná. Bit-exaktní (validace zelená).
+2. **No-flag (straight-line) tahy (+7 %).** Optimistický tah ve v2 ještě nesl
+   per-draw test `bad |= res < TH` (RNG rejection, ~1× na 18 M indexů) — **OR
+   řetězený přes celý screen**, serializuje plánování. V6 ho z horké cesty
+   vyhazuje: tahy jdou rovně a **každý** index, jehož horký count překoná floor,
+   se přepočítá na přesné studené cestě (`exact_redo_l`, jediný publisher,
+   řádná rejection smyčka) → **report bytově identický (0 rejected)**. Jediná
+   teoretická ztráta: rekord s rejectionem ve svých tažených krocích se může
+   minout (~1e-7/chunk) — nikdy ne špatný report.
+3. **STOP přeladěný na PRODUKČNÍ floor → 13 (ne 12) (+5 %).** Sweep STOP běžel na
+   bench floor 8, ale worker nese `winBest` (~13) do floor launche, kde se
+   divergentní ocas skoro nikdy nespustí — takže **o jeden povinný screen tah
+   míň vyhrává**. STOP=13 vyhrává napříč f12–15; STOP=14 je na f14+ rychlejší,
+   ale na f12 se hroutí (moc citlivé pro fixní kernel).
+
+Naměřeno (bench2, produkční tvar 2560×256, chunk 2^31):
+
+```
+kernel                  f8     f12    f13    f14
+hp    <256,12> (v2)    63.7   65.6   66.5   66.1
+nf    <256,13> (v3)    65.2   70.7   74.3   75.1
+reuse <256,13,B512> V6 77.0   77.3   81.9   83.3
+```
+
+**Ostrý server (RawPower, 2026-06-15, A/B ve stejné session, 0 rejected):**
+v2 64.4 → v3 72.3 → **V6 82.3 B/s** (server rate field) = **+26 % proti v2**
+(+14 % proti v3), session best 14–15 jako obvykle. Bench na floor 13: v2 66 →
+**V6 ~82 (+24 %)**. Proti původnímu workeru v rodokmenu (~18 B/s) je to **~4.5×**.
+
+**Co tentokrát NEfungovalo (změřeno, zavrženo):** inkrementální seed −2.5 %
+(64bit násobení se pipelinuje dobře, přírůstkový add jen prodlouží řetězec);
+adds→IMAD na no-flag tahu −3 %; 2-index ILP ≈neutrál; refresh 16/32 horší (8
+zůstává); chunk 2^32 horší na produkčním floor 13 (2^31 + TDR rezerva); reuse
+blok 128 horší / 1024 nevyrovnaný (512 optimální); 32bit blokový čítač („lean")
+nesnížil registry a byl pomalejší.
+
+Pointa kola 2: i „triviální" seedovací krok šel zlevnit **algebraickou
+identitou** (`b(k)=a(k+1)`), ne mikro-optimalizací — opět platí „reformuluj,
+než ladíš instrukce", a „měř na floor, na kterém to reálně běží".
+
+---
+
+## TURBO v2 ✅ ~2.3× — popcount bound, server naměřil ~68 B/s
 
 `MAINBOGOGPU_NVIDIA_newAPI_turbo.cu` (tentýž soubor, kernel přepracovaný
 2026-06-13). Tři nové kroky nad H-mask kernelem, všechny ověřené stejnou

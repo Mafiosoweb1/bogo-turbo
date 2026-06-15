@@ -1,14 +1,20 @@
 # bogo-turbo
 
-**A fast CUDA worker for the [bogosort crowd-compute project](https://bogo.swapjs.dev) — ~3.8× the original CUDA worker it grew from (~2.3× the count-only baseline), with results byte-identical to the official engine and verified by the server (0 rejected).**
+**A fast CUDA worker for the [bogosort crowd-compute project](https://bogo.swapjs.dev) — ~4.5× the original CUDA worker it grew from (~2.7× the count-only baseline), with results byte-identical to the official engine and verified by the server (0 rejected).**
 
 Made by **MAF** · MIT License · Windows & Linux · NVIDIA RTX 20xx–50xx
 
-> **Update 2026-06-13 — turbo v2:** new popcount-bound kernel, **server-measured
-> ~68 B shuffles/s on an RTX 4080 SUPER (was 47.2, +44 %)**. Same byte-identical
-> results, same full validation suite, prebuilt `dist/` binary updated. What
-> changed and why: [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) (EN) /
+> **Update 2026-06-15 — V6:** three new wins over v2 — straight-line **no-flag
+> draws** (the RNG rejection test leaves the hot path; candidates are verified
+> exactly on the cold path, so reports stay byte-identical), the **screen depth
+> re-swept at the real production floor** (STOP 13), and **SplitMix reuse** (the
+> algebraic identity `b(k)=a(k+1)` lets consecutive indices share one SplitMix64,
+> halving the per-index seed cost). Same-session live A/B on an RTX 4080 SUPER:
+> **64.4 → 82.3 B shuffles/s, +26 %, 0 rejected**. What changed and why:
+> [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) (EN) /
 > [docs/OPTIMIZATIONS_CZ.md](docs/OPTIMIZATIONS_CZ.md) (CZ).
+>
+> <sub>(2026-06-13 — turbo v2: popcount-bound kernel + H/E split screen, 47.2 → ~68 B/s.)</sub>
 
 > **Origin:** this is a modified, heavily optimized version of a community CUDA
 > worker for the official [bogosort](https://bogo.swapjs.dev/) project by swap &
@@ -23,19 +29,20 @@ Made by **MAF** · MIT License · Windows & Linux · NVIDIA RTX 20xx–50xx
 
 [bogo.swapjs.dev](https://bogo.swapjs.dev) is a community project where contributors burn GPU cycles shuffling a 25-card deck (Fisher-Yates + xoshiro128++), hunting for shuffles with the most fixed points. This repository contains an optimized native CUDA worker for it:
 
-| | original CUDA worker | count-only baseline | turbo v1 | **bogo-turbo v2** |
-|---|---|---|---|---|
-| RTX 4080 SUPER throughput | ~18 B shuffles/s | 29.65 B shuffles/s | 47.2 B shuffles/s | **~68 B shuffles/s** |
-| results | byte-identical | byte-identical | byte-identical | byte-identical |
-| rejected reports | 0 | 0 | 0 | 0 |
+| | original CUDA worker | count-only baseline | turbo v1 | turbo v2 | **bogo-turbo V6** |
+|---|---|---|---|---|---|
+| RTX 4080 SUPER throughput | ~18 B shuffles/s | 29.65 B shuffles/s | 47.2 B shuffles/s | ~68 B shuffles/s | **~82 B shuffles/s** |
+| results | byte-identical | byte-identical | byte-identical | byte-identical | byte-identical |
+| rejected reports | 0 | 0 | 0 | 0 | 0 |
 
-(All three optimized-worker numbers are server-measured on the same card; v2
-also passed the full local validation suite — best-score equality against a
-full scan on 3 seeds × 2^30 plus 40 sub-ranges, CPU recheck of every triple.
-The original is where this worker's lineage started, before any of the
-optimizations below.)
+(All optimized-worker numbers are server-measured on the same card; every
+version also passed the full local validation suite — best-score equality
+against a full scan on 3 seeds × 2^30 plus 40 sub-ranges, CPU recheck of every
+triple. v2→V6 is **+26 % measured in a same-session A/B** (64.4 → 72.3 → 82.3 B/s
+across v2/v3/V6). The original is where this worker's lineage started, before
+any of the optimizations below.)
 
-Rough expectations on other cards (~1.4× the v1 numbers): RTX 2060 ≈ 9–11 B/s, RTX 3070 ≈ 21 B/s, RTX 4070 ≈ 35 B/s.
+Rough expectations on other cards (~1.7× the v1 numbers): RTX 2060 ≈ 11–13 B/s, RTX 3070 ≈ 26 B/s, RTX 4070 ≈ 43 B/s.
 
 ## Quick start (prebuilt, Windows)
 
@@ -56,13 +63,15 @@ Everything is in [`src/`](src/) with auto-detecting build scripts for Windows (M
 
 ## How it is fast (and still exact)
 
-The server credits the number of shuffles scanned and verifies the best reported triple `(index, permutation, fixed-point count)`. Five ideas stack on top of the baseline count-only kernel — none of them change a single reported byte:
+The server credits the number of shuffles scanned and verifies the best reported triple `(index, permutation, fixed-point count)`. Eight ideas stack on top of the baseline count-only kernel — none of them change a single reported byte:
 
 1. **Branch-and-bound pruning** — in a high→low Fisher-Yates, position `i` is finalized at step `i`, so once `c + i + 1 ≤ batch best` the index can never win and the remaining steps are skipped (alpha-beta style). The winner is recomputed in full, so reports stay byte-identical.
-2. **Optimistic draws** — the RNG rejection-sampling loops (taken ~once per 18M indices) are removed from the hot path; a would-be rejection just sets a flag and the affected index is redone exactly on a cold path. Straight-line code lets the compiler schedule across all 24 steps.
+2. **No-flag straight-line draws** (v1→v3) — the RNG rejection-sampling loop (taken ~once per 18M indices) is removed from the hot path entirely. Every index whose hot count beats the launch best is re-evaluated on the exact rejection-handling cold path, which is the **sole publisher** — so reports stay byte-identical while the hot draws carry no rejection test at all. (v1 still flagged a would-be rejection per draw; v3 drops even that loop-carried OR, letting the compiler schedule freely across the screen.)
 3. **H-mask reformulation** — the fixed-point count is a function of the draw sequence alone: position `i` is fixed iff `j_i == i` and no earlier step hit `i` (position 0 iff never hit). The hot loop therefore keeps just a 25-bit hit mask in a register: **no permutation array, no shared memory, 100% occupancy**. The exact permutation is materialized only for winners.
 4. **Popcount bound** (v2) — the pruning bound from idea 1 assumes every remaining position can still become fixed; the H mask knows better: position `p` can only become fixed while its bit is **still unhit**. The bound tightens to `c + popc(~H & low bits)`, which prunes almost every index immediately after the screen instead of walking a warp-divergent tail.
-5. **H/E split screen** (v2) — the screen keeps two pure OR-accumulators (`H` = all hits, `E` = hits from a foreign step), so fixed positions are just `H & ~E` and the entire bound test collapses to **one LOP3 + one POPC** with no per-draw compare and no dependency chain. Together with a shorter screen, a re-swept launch shape and carrying the report-window best into each launch's floor, v2 measures **+47% over v1** on the same bench.
+5. **H/E split screen** (v2) — the screen keeps two pure OR-accumulators (`H` = all hits, `E` = hits from a foreign step), so fixed positions are just `H & ~E` and the entire bound test collapses to **one LOP3 + one POPC** with no per-draw compare and no dependency chain. Together with a re-swept launch shape and carrying the report-window best into each launch's floor, v2 measures **+47% over v1** on the same bench.
+6. **Screen depth tuned at the real floor** (V6) — the screen length was originally swept at the benchmark's pessimistic floor (8). But the worker carries the report-window best (~13) into each launch's floor, and at that floor the divergent tail almost never fires — so one *fewer* mandatory screen draw is strictly faster. Re-sweeping at the operating floor moves the optimum from 12 to 13 mandatory draws.
+7. **SplitMix reuse** (V6) — the per-index seed is `a(k)=SplitMix64(base+(k+1)·g)`, `b(k)=SplitMix64(base+(k+2)·g)`, so `b(k)==a(k+1)`: **two consecutive indices share one SplitMix64**. Each thread walks a contiguous block of indices instead of grid-striding, reusing the previous index's `b` as this index's `a` — so each index costs *one* SplitMix, not two. The mix is on the same ALU pipe the screen saturates, so halving it speeds up *every* index. A pure algebra identity, bit-exact. Ideas 2 + 6 + 7 together are **+26% over v2 on the live server** (same-session A/B 64.4 → 82.3 B/s, 0 rejected).
 
 Every variant was validated against a CPU reference (best-score equality across seeds and 40 sub-ranges, plus CPU recheck of every reported triple) and profiled with Nsight Compute — the full optimization history, including everything that *didn't* work, is in [`docs/OPTIMIZATIONS_CZ.md`](docs/OPTIMIZATIONS_CZ.md) (Czech) and summarized in [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) (English).
 

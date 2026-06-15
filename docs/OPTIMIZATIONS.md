@@ -1,11 +1,16 @@
 # Optimization history (English summary)
 
-How the worker went from **29.65 → 47.2 → ~68 B shuffles/s** (all
+How the worker went from **29.65 → 47.2 → ~68 → ~82 B shuffles/s** (all
 server-measured) on an RTX 4080 SUPER through measure-first engineering — and
 from **~18 B/s** counting the worker's whole lineage (the count-only kernel
 rewrite that preceded this work took the original ~18–22 B/s worker to 29.65).
 The full Czech write-up with every number lives in
 [OPTIMIZATIONS_CZ.md](OPTIMIZATIONS_CZ.md).
+
+The 2026-06-15 round (shipped as **V6**) added three more — no-flag draws, a
+production-floor STOP re-sweep, and SplitMix reuse — for **+26 % over v2 on the
+live server** (same-session A/B: 64.4 → 72.3 → 82.3 B/s, 0 rejected). See
+rows 8–10.
 
 The engine constraint throughout: the server verifies the best reported triple
 `(index, permutation, count)` and the PRNG sequence (SplitMix64 → xoshiro128++ →
@@ -26,6 +31,9 @@ below change *how much work* is done, never *what is reported*.
 | **5. H/E split screen** | 57.1 B/s | +13 % | the per-draw count bookkeeping (`if (j==i && !(H & 1<<i)) c++` — compare + mask test + predicated add, serialized on H) is replaced by two pure OR-accumulators: `H \|= 1<<j` (all hits) and `E \|= (1<<j) & ~(1<<i)` (hits from a *foreign* step; since `j ≤ i` no compare is needed). Fixed = `H & ~E`, so `c = popc(H & ~E)` — and because the two sets are disjoint, the whole bound test collapses to **one LOP3 + one POPC**: `popc((H & ~E) \| (~H & LOWMASK)) > best`. Both accumulators are reorderable by the scheduler — no dependency chain through the screen |
 | **6. shorter screen + shape re-sweep** | 65.5 B/s | +15 % | the far tighter bound lets the test move 2 steps earlier (screen 24..13, test at step 12 — swept 10–13) and the kernel shape re-swept to 256×2560 (was 128×2880) |
 | **7. window-best floor carry-over** | +2–4 % | | each launch's floor is pre-seeded with the report-window best so the kernel only chases counts that would *improve the report*; the floor must be exactly `winBest` (anything higher could silently drop a better find) and the floor-0 fallback relaunch is now needed only when no best is held yet |
+| **8. no-flag straight-line draws** (v3) | +7 % | the optimistic draw still carried a per-draw `bad \|= res<TH` rejection test — a loop-carried OR through the whole screen. v3 drops it entirely: draws run straight-line, and EVERY index whose hot count beats the launch best is re-evaluated on the exact rejection-handling cold path (`exact_redo_l`), now the sole publisher — so reports stay byte-identical (0 rejected). Removing the dependency lets ptxas schedule across draws. Cost: a record that hides an RNG rejection in its drawn steps can be missed (~1e-7/chunk), never a wrong report |
+| **9. STOP re-swept at the production floor** (V6) | +5 % | the original STOP sweep ran at the bench's pessimistic floor 8 and chose 12. But the worker carries `winBest` (~13) into each launch's floor, and at that floor the divergent tail almost never fires — so one fewer mandatory screen draw wins. STOP=13 beats 12 across floors 12–15 (STOP=14 is faster at f14+ but collapses at f12 — too floor-sensitive for a fixed kernel) |
+| **10. SplitMix reuse** (V6) | +10–15 % | `seed_expand(k)` sets `a=mix(base+(k+1)·g)`, `b=mix(base+(k+2)·g)`, so `b(k)==a(k+1)` — two consecutive indices share one SplitMix64. Each thread walks a contiguous block (`BLOCK_SIZE`) instead of grid-striding, reusing the previous index's `b` as this index's `a`, so each index costs ONE mix() not two. The mix xor-shifts sit on the ALU bottleneck, so halving them helps at *every* floor (hence the live gain beats the floor-13 bench delta). Bit-exact: a pure algebraic identity, validated green. Costs 8 regs (occupancy 100→83 %), more than repaid |
 
 Validated like every step before: best-score equality on 3 seeds × 2^30 + 40
 sub-ranges, CPU recheck of every reported triple, for **every** variant in the
@@ -55,6 +63,15 @@ micro-optimizing applies recursively.
   20 threads ≈ +0.4 % of the GPU — not worth the heat
 - RAM speed: irrelevant (the hot path never touches DRAM)
 - async host pipelining: launch gap is ~0.2 % at chunk 2^32
+- (2026-06-15 round) incremental seed `si += stride*golden`: −2.5 % (the 64-bit
+  `index*golden` pipelines fine; the carried add just lengthens a dependency
+  chain); adds→IMAD on the no-flag draw: −3 %; 2-index ILP: ≈neutral (46 regs,
+  occupancy drops); refresh every 16/32: slightly worse (8 stays optimal);
+  **chunk 2^32: faster at floor 8 but *worse* at the production floor 13** — a
+  reminder to sweep at the floor the worker actually runs (kept 2^31, +TDR
+  margin); for the SplitMix-reuse kernel: block size 128 (per-block overhead) /
+  1024 (load imbalance) lose to 512; a 32-bit in-block counter ("lean") didn't
+  cut registers and ran slower
 
 ## Validation methodology
 
@@ -72,4 +89,11 @@ testing, all-time best on the account is 16).
    5× win, and a "+10 %" FMA rebalance that measured −8 %).
 2. **Read the SASS** — the optimistic-draw win was invisible from CUDA C.
 3. **Reformulate before you micro-optimize** — the H-mask insight (count needs
-   no array) beat every instruction-level trick combined.
+   no array) beat every instruction-level trick combined; and even the
+   "irreducible" seed step fell to a pure algebra identity (`b(k)=a(k+1)` →
+   one SplitMix per index, not two), not to instruction tuning.
+4. **Sweep at the operating point, not a convenient proxy** — STOP was tuned at
+   the bench's floor 8, but the worker runs at floor ~13. Re-sweeping at the
+   real floor flipped the optimum (13, not 12) and chunk size (2^31, not 2^32),
+   together a free +5 %. A parameter is only "optimal" relative to the regime it
+   was measured in.
