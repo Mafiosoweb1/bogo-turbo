@@ -29,6 +29,7 @@ echo Compiling multi-arch (sm_75/86/89/120 + PTX), static cudart...
   -gencode arch=compute_89,code=sm_89 ^
   -gencode arch=compute_120,code=sm_120 ^
   -gencode arch=compute_75,code=compute_75 ^
+  -gencode arch=compute_120,code=compute_120 ^
   MAINBOGOGPU_NVIDIA_newAPI_turbo.cu -o bogo_gpu_turbo.exe ^
   -I"%VCPKG%\include" -L"%VCPKG%\lib" ^
   -lixwebsocket -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -lz ^
