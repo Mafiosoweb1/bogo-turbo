@@ -1,8 +1,9 @@
 @echo off
 title build bogo_gpu_turbo (portable, RTX 20xx-50xx)
 cd /d "%~dp0"
-rem Builds a PORTABLE exe: SASS for sm_75/86/89/120 + PTX fallback,
-rem static cudart. Slower to compile (~5x), result runs on any RTX.
+rem Builds a PORTABLE exe: SASS for sm_75/86/89/90/120 + PTX fallback,
+rem static cudart. Slower to compile (~5x), result runs on any RTX (and on
+rem H200/Hopper natively via sm_90, not just PTX JIT).
 
 set "VCVARS="
 for %%p in (
@@ -22,11 +23,12 @@ if not defined VCPKG_ROOT set "VCPKG_ROOT=C:\vcpkg"
 set "VCPKG=%VCPKG_ROOT%\installed\x64-windows"
 if not exist "%VCPKG%\include\ixwebsocket" ( echo [ERROR] run: vcpkg install ixwebsocket nlohmann-json & pause & exit /b 1 )
 
-echo Compiling multi-arch (sm_75/86/89/120 + PTX), static cudart...
+echo Compiling multi-arch (sm_75/86/89/90/120 + PTX), static cudart...
 "%NVCC%" -O3 -std=c++17 -allow-unsupported-compiler -Xcompiler "/MD" -cudart static ^
   -gencode arch=compute_75,code=sm_75 ^
   -gencode arch=compute_86,code=sm_86 ^
   -gencode arch=compute_89,code=sm_89 ^
+  -gencode arch=compute_90,code=sm_90 ^
   -gencode arch=compute_120,code=sm_120 ^
   -gencode arch=compute_75,code=compute_75 ^
   -gencode arch=compute_120,code=compute_120 ^

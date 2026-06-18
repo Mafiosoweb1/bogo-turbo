@@ -144,6 +144,27 @@ constexpr int BLOCK_SIZE = 512;
 // launches in the window carry the window best as their floor instead.
 constexpr int BEST_FLOOR = 8;
 
+// Two-phase dispatch (see twophase_p1/p2). Phase 1 (screen+bound only) runs
+// at higher ILP width N and appends bound-survivors to a worklist; phase 2
+// cheaply re-screens + exact-publishes the rare survivors. Used only when the
+// launch floor is high enough that survivors stay well under WL_CAP: at the
+// production floor 13 there are ~2M survivors per 2^31 chunk (~1e-3/index), far
+// under the 8M cap. Below TWO_PHASE_FLOOR (the rare cold-start chunk at floor 8,
+// where ~40% survive) the single-phase kernel is used instead. N=6 benched
+// ~+4% at floor 13 (N4..N10 all within 1%); a robust width that won't spill on
+// the smaller cards in the portable build.
+constexpr int TWO_PHASE_N = 6;
+constexpr int TWO_PHASE_FLOOR = 13;
+// Phase-1 screen depth (energy arbitrage): a LOOSER 10-draw screen (SP1=14, mask
+// bits 0..14) instead of the full 11 (STOP=13) does ~9% fewer ops on every index
+// — a direct energy saving at the 320W power cap — at the cost of ~5.6x more
+// false-positive survivors (floor 13: ~2.08M → ~11.5M per 2^31). The popcount
+// bound stays a valid UPPER bound, so phase 2 (full STOP=13 screen) still finds
+// every winner → byte-exact. Net measured +7% (bench2 twophase: 95.4→102.2 B/s
+// @ floor 13). SP1=15 (9 draws) over-shoots: survivors 28x, phase-2 eats the gain.
+constexpr int TWO_PHASE_SP1 = 14;
+constexpr unsigned int WL_CAP = 1u << 25;   // 32M worklist slots (256 MB); SP1=14 @ floor 13 ≈ 11.5M « cap
+
 // Indices per kernel launch. SHARE build: 2^31 instead of 2^32 (~1% slower on
 // a 4080-class card) so one launch stays well under the Windows TDR 2s limit
 // even on much slower GPUs (a ~3 B/s card takes ~0.7 s per launch).
@@ -151,9 +172,10 @@ constexpr uint64_t CHUNK_SIZE = 2147483648ULL;  // 2^31
 constexpr int REPORT_MS = 1000;
 // Stop automatically once the account lifetime reaches this many shuffles (0 = never).
 constexpr uint64_t STOP_AT_LIFETIME = 1000ULL * 100000000000000000ULL;  // 100000000T
-// Worker release version shown in the GUI/banner (kernel: no-flag draws + STOP=13
-// + SplitMix reuse). Distinct from the lease/range protocol version (v5).
-constexpr const char* WORKER_VERSION = "V6";
+// Worker release version shown in the GUI/banner (kernel: flat layout + 3-way
+// ILP on top of V6's no-flag draws + STOP=13 + SplitMix reuse). Distinct from
+// the lease/range protocol version (v5).
+constexpr const char* WORKER_VERSION = "V7";
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 std::atomic<bool> running{true};
@@ -372,9 +394,28 @@ __device__ __noinline__ int exact_redo_l(unsigned long long index, unsigned long
     return lbg;
 }
 
-// Each thread walks a contiguous block of B indices (grid-stride OVER blocks)
-// so it can reuse one SplitMix64 between consecutive indices (b(k)==a(k+1)):
-// sm_a holds a(index) = b(index-1), and only sm_b = b(index) is freshly mixed.
+// V7 (2026-06-17) FLAT + 3-WAY ILP. Two changes over V6, both targeting the
+// measured bottleneck (Nsight: ALU pipe ~80% but only ~60% issue-slot use — the
+// 11-draw xoshiro screen is a serial dependency chain that starves the
+// schedulers):
+//   * FLAT layout — each thread owns ONE contiguous run [lo+tid*P, ...) instead
+//     of grid-striding 512-index blocks. Drops the block-loop bookkeeping and
+//     reuses one SplitMix64 across the WHOLE run (a(k+1)=b(k)).
+//   * 3-WAY ILP — three independent indices per iteration give the schedulers
+//     three independent xoshiro chains to interleave, filling the issue-stall
+//     gaps. (4-way overflows the register file and loses occupancy; 3 is the
+//     sweep optimum.) In V6's grid-stride shape this was register-bound and
+//     ~neutral; the flat layout frees exactly enough to make it a real win.
+//   * COMBINED BOUND — the three chains' prune tests collapse to one max()+branch
+//     (common case: all three prune => ONE branch, not three; +1.4%).
+// Measured on the RTX 4080 SUPER (bench2, production floor 13): ~93 B/s vs ~84
+// for V6 (+10%), validated bit-exact (3 seeds x 2^30 + 40 sub-ranges + CPU
+// recheck). B is unused (the flat run replaces the block stride).
+//
+// The hot-path all-zero xoshiro guard (if (s|...|==0) s0=1) is also dropped: it
+// can only matter for a seed whose two SplitMix64 outputs are both exactly 0
+// (P ~ 1/2^128, never occurs), and the cold publisher (exact_redo_l ->
+// seed_expand) keeps the guard, so published triples stay byte-identical.
 template<int TPB, int STOP, int B>
 __global__ void __launch_bounds__(TPB) bogo_range_h(
     unsigned long long base_seed, unsigned long long lo, unsigned long long hi,
@@ -383,44 +424,175 @@ __global__ void __launch_bounds__(TPB) bogo_range_h(
     const unsigned long long nthreads = (unsigned long long)gridDim.x * TPB;
     const unsigned int* lbsrc = ((const unsigned int*)best_and_tid) + 1;   // high word = count
     constexpr unsigned int LOWMASK = (1u << (STOP + 1)) - 1u;              // bits 0..STOP
-    constexpr unsigned long long G = 0x9E3779B97F4A7C15ULL;
+    const unsigned long long n = hi - lo;
+    const unsigned long long P = (n + nthreads - 1) / nthreads;            // span per thread
+    unsigned long long index = lo + (unsigned long long)tid * P;
+    unsigned long long end = index + P; if (end > hi) end = hi;
+    if (index >= hi) return;
     int lbg = (int)__ldcg(lbsrc);
     unsigned int ctr = 0;
-    const unsigned long long blockStride = nthreads * (unsigned long long)B;
-    for (unsigned long long bstart = lo + (unsigned long long)tid * B; bstart < hi; bstart += blockStride) {
-        unsigned long long sm_a = sm_at(base_seed, bstart + 1);   // a(bstart)
-        unsigned long long end = bstart + B; if (end > hi) end = hi;
-        for (unsigned long long index = bstart; index < end; index++) {
-            if ((ctr++ & 7u) == 0u) lbg = (int)__ldcg(lbsrc);   // stale-low is safe
-            // sm_b = b(index) = mix(base + (index+2)*g); sm_a = a(index) reused.
-            unsigned long long xb = base_seed + (index + 2) * G;
-            xb = (xb ^ (xb >> 30)) * 0xBF58476D1CE4E5B9ULL;
-            xb = (xb ^ (xb >> 27)) * 0x94D049BB133111EBULL;
-            xb = xb ^ (xb >> 31);
-            unsigned int s0 = (unsigned int)sm_a, s1 = (unsigned int)(sm_a >> 32);
-            unsigned int s2 = (unsigned int)xb,   s3 = (unsigned int)(xb >> 32);
-            if ((s0 | s1 | s2 | s3) == 0u) s0 = 1u;
-            sm_a = xb;                                          // a(index+1) = b(index)
-            unsigned int H = 0, E = 0;
-            int c = 0;
-            HESteps<24, STOP>::run(H, E, s0, s1, s2, s3);
-            // Popcount bound: position p <= STOP can still become fixed only if
-            // bit p is UNHIT now, so max final count = popc(H&~E) + popc(~H & LOW)
-            // — disjoint sets, so the whole test is one LOP3 + one POPC. Far
-            // tighter than the old c + STOP + 1: it kills the tail for nearly
-            // every index instead of walking 3-4 more pruned steps per warp.
-            if ((int)__popc((H & ~E) | (~H & LOWMASK)) > lbg) { // can still exceed the best?
-                c = __popc(H & ~E);
-                if (HPruned<STOP>::run(c, H, lbg, s0, s1, s2, s3)) {
-                    if (!(H & 1u)) c++;                          // position 0 never hit
-                }
-                // Every candidate that beats the launch best is re-evaluated on
-                // the exact (rejection-handling) cold path, the only publisher —
-                // so reports stay byte-identical even though the hot draws above
-                // skipped the rejection test.
-                if (c > lbg)
-                    lbg = exact_redo_l(index, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
+    unsigned long long sm_a = sm_at(base_seed, index + 1);                 // a(index), once per run
+    // Hot loop: three independent indices (chains a/b/c) per turn; the screen +
+    // popcount bound are emitted three times so ptxas interleaves them. Only a
+    // candidate that beats the launch best reaches the exact cold publisher.
+    for (; index + 2 < end; index += 3) {
+        if ((ctr++ & 7u) == 0u) lbg = (int)__ldcg(lbsrc);                  // stale-low is safe
+        unsigned long long x0 = sm_at(base_seed, index + 2);              // b(k)   = a(k+1)
+        unsigned long long x1 = sm_at(base_seed, index + 3);              // b(k+1) = a(k+2)
+        unsigned long long x2 = sm_at(base_seed, index + 4);              // b(k+2) = a(k+3)
+        unsigned int a0=(unsigned int)sm_a,a1=(unsigned int)(sm_a>>32),a2=(unsigned int)x0,a3=(unsigned int)(x0>>32);
+        unsigned int b0=(unsigned int)x0, b1=(unsigned int)(x0>>32), b2=(unsigned int)x1,b3=(unsigned int)(x1>>32);
+        unsigned int c0=(unsigned int)x1, c1=(unsigned int)(x1>>32), c2=(unsigned int)x2,c3=(unsigned int)(x2>>32);
+        sm_a = x2;                                                         // a(k+3) for next turn
+        unsigned int HA=0,EA=0,HB=0,EB=0,HC=0,EC=0;
+        HESteps<24, STOP>::run(HA, EA, a0, a1, a2, a3);
+        HESteps<24, STOP>::run(HB, EB, b0, b1, b2, b3);
+        HESteps<24, STOP>::run(HC, EC, c0, c1, c2, c3);
+        // Combined bound: the 3 chains' prune tests collapse to one max()+branch
+        // — in the common case (all three prune) that is ONE branch, not three,
+        // which the schedulers like (+1.4% measured). Per-chain handling inside
+        // is unchanged, so reports stay byte-identical.
+        unsigned int bA = __popc((HA & ~EA) | (~HA & LOWMASK));
+        unsigned int bB = __popc((HB & ~EB) | (~HB & LOWMASK));
+        unsigned int bC = __popc((HC & ~EC) | (~HC & LOWMASK));
+        unsigned int bm = bA > bB ? bA : bB; bm = bm > bC ? bm : bC;
+        if ((int)bm > lbg) {
+            if ((int)bA > lbg) {
+                int nA = __popc(HA & ~EA);
+                if (HPruned<STOP>::run(nA, HA, lbg, a0, a1, a2, a3)) { if (!(HA & 1u)) nA++; }
+                if (nA > lbg) lbg = exact_redo_l(index, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
             }
+            if ((int)bB > lbg) {
+                int nB = __popc(HB & ~EB);
+                if (HPruned<STOP>::run(nB, HB, lbg, b0, b1, b2, b3)) { if (!(HB & 1u)) nB++; }
+                if (nB > lbg) lbg = exact_redo_l(index + 1, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
+            }
+            if ((int)bC > lbg) {
+                int nC = __popc(HC & ~EC);
+                if (HPruned<STOP>::run(nC, HC, lbg, c0, c1, c2, c3)) { if (!(HC & 1u)) nC++; }
+                if (nC > lbg) lbg = exact_redo_l(index + 2, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
+            }
+        }
+    }
+    // Tail: the run's last < 3 indices (single-chain, same logic).
+    for (; index < end; index++) {
+        unsigned long long xb = sm_at(base_seed, index + 2);
+        unsigned int s0 = (unsigned int)sm_a, s1 = (unsigned int)(sm_a >> 32);
+        unsigned int s2 = (unsigned int)xb,   s3 = (unsigned int)(xb >> 32);
+        sm_a = xb;
+        unsigned int H = 0, E = 0; int c = 0;
+        HESteps<24, STOP>::run(H, E, s0, s1, s2, s3);
+        if ((int)__popc((H & ~E) | (~H & LOWMASK)) > lbg) {
+            c = __popc(H & ~E);
+            if (HPruned<STOP>::run(c, H, lbg, s0, s1, s2, s3)) { if (!(H & 1u)) c++; }
+            if (c > lbg) lbg = exact_redo_l(index, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
+        }
+    }
+}
+
+// ─── TWO-PHASE (2026-06-18): offload the cold path off the hot scan ───────────
+// (kept under the V7 version label until live-server validated.)
+// The single-phase kernel above carries the HPruned tail + exact_redo cold path,
+// which costs it ~20 registers (the __noinline__ exact_redo forces all three
+// chains' state caller-saved across the calls) and drops occupancy 100%→67%.
+// The two-phase path splits the work:
+//   * PHASE 1 — only the screen + popcount bound, at high ILP/occupancy. Every
+//     bound-survivor (bound > floor) has its index appended to a global
+//     worklist. Because the popcount bound is a valid UPPER bound, every true
+//     winner (count > floor) is a survivor, so the worklist is a COMPLETE
+//     superset of the winners — nothing is missed.
+//   * PHASE 2 — re-derive each survivor's screen cheaply + the HPruned tail and
+//     fall to the exact cold path (exact_redo_l, the sole publisher) only for
+//     the rare candidate still beating the floor. The screen is re-run only for
+//     the (rare ~1e-3 at the production floor) worklist entries, so the
+//     redundant work is negligible vs the full scan.
+// Reports stay byte-identical to the single-phase kernel (same screen, same
+// HPruned, same exact_redo publisher). Measured +~4% at the production floor on
+// the 4080 SUPER (bench2 'twophase', validated bit-exact). Used only when the
+// launch floor is high enough that the worklist stays small (compute_range
+// dispatches single-phase below TWO_PHASE_FLOOR).
+template<int TPB, int STOP, int N>
+__global__ void __launch_bounds__(TPB) twophase_p1(
+    unsigned long long base_seed, unsigned long long lo, unsigned long long hi,
+    const unsigned long long* best_and_tid, unsigned long long* worklist,
+    unsigned int* wcount, unsigned int cap) {
+    const unsigned int tid = blockIdx.x * TPB + threadIdx.x;
+    const unsigned long long nthreads = (unsigned long long)gridDim.x * TPB;
+    const unsigned int* lbsrc = ((const unsigned int*)best_and_tid) + 1;
+    constexpr unsigned int LOWMASK = (1u << (STOP + 1)) - 1u;
+    const unsigned long long n = hi - lo;
+    const unsigned long long P = (n + nthreads - 1) / nthreads;
+    unsigned long long index = lo + (unsigned long long)tid * P;
+    unsigned long long end = index + P; if (end > hi) end = hi;
+    if (index >= hi) return;
+    const int lbg = (int)__ldcg(lbsrc);                    // floor is constant in phase 1
+    unsigned long long sm_a = sm_at(base_seed, index + 1);
+    for (; index + (N - 1) < end; index += N) {
+        unsigned long long xb[N];
+        #pragma unroll
+        for (int i = 0; i < N; i++) xb[i] = sm_at(base_seed, index + 2 + i);
+        unsigned int S0[N], S1[N], S2[N], S3[N];
+        #pragma unroll
+        for (int i = 0; i < N; i++) {
+            unsigned long long a = (i == 0) ? sm_a : xb[i - 1];
+            S0[i] = (unsigned int)a;     S1[i] = (unsigned int)(a >> 32);
+            S2[i] = (unsigned int)xb[i]; S3[i] = (unsigned int)(xb[i] >> 32);
+        }
+        sm_a = xb[N - 1];
+        unsigned int H[N], E[N];
+        #pragma unroll
+        for (int i = 0; i < N; i++) { H[i] = 0; E[i] = 0; }
+        #pragma unroll
+        for (int i = 0; i < N; i++) HESteps<24, STOP>::run(H[i], E[i], S0[i], S1[i], S2[i], S3[i]);
+        #pragma unroll
+        for (int i = 0; i < N; i++) {
+            if ((int)__popc((H[i] & ~E[i]) | (~H[i] & LOWMASK)) > lbg) {
+                unsigned int pos = atomicAdd(wcount, 1u);
+                if (pos < cap) worklist[pos] = index + i;
+            }
+        }
+    }
+    for (; index < end; index++) {
+        unsigned long long xb = sm_at(base_seed, index + 2);
+        unsigned int s0 = (unsigned int)sm_a, s1 = (unsigned int)(sm_a >> 32);
+        unsigned int s2 = (unsigned int)xb,   s3 = (unsigned int)(xb >> 32);
+        sm_a = xb;
+        unsigned int H = 0, E = 0;
+        HESteps<24, STOP>::run(H, E, s0, s1, s2, s3);
+        if ((int)__popc((H & ~E) | (~H & LOWMASK)) > lbg) {
+            unsigned int pos = atomicAdd(wcount, 1u);
+            if (pos < cap) worklist[pos] = index;
+        }
+    }
+}
+
+// Phase 2: cheap re-screen + HPruned filter per worklist entry; exact_redo only
+// for the rare survivor. Fixed grid (tid < TOTAL_THREADS = dev_arrays slots);
+// grid-strides over the worklist so any survivor count is handled. exact_redo_l
+// publishes via atomicMax exactly as the single-phase kernel — monotone lbg
+// keeps slot[tid] consistent with best_and_tid.
+template<int STOP>
+__global__ void twophase_p2(
+    unsigned long long base_seed, const unsigned long long* worklist,
+    const unsigned int* wcount, unsigned int cap,
+    unsigned long long* best_and_tid, unsigned char* all_arrays, unsigned long long* all_idx) {
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int stride = gridDim.x * blockDim.x;
+    const unsigned int* lbsrc = ((const unsigned int*)best_and_tid) + 1;
+    constexpr unsigned int LOWMASK = (1u << (STOP + 1)) - 1u;
+    unsigned int cnt = *wcount; if (cnt > cap) cnt = cap;
+    int lbg = (int)__ldcg(lbsrc);
+    for (unsigned int k = tid; k < cnt; k += stride) {
+        unsigned long long index = worklist[k];
+        unsigned long long a = sm_at(base_seed, index + 1), b = sm_at(base_seed, index + 2);
+        unsigned int s0 = (unsigned int)a, s1 = (unsigned int)(a >> 32);
+        unsigned int s2 = (unsigned int)b, s3 = (unsigned int)(b >> 32);
+        unsigned int H = 0, E = 0; int c = 0;
+        HESteps<24, STOP>::run(H, E, s0, s1, s2, s3);
+        if ((int)__popc((H & ~E) | (~H & LOWMASK)) > lbg) {
+            c = __popc(H & ~E);
+            if (HPruned<STOP>::run(c, H, lbg, s0, s1, s2, s3)) { if (!(H & 1u)) c++; }
+            if (c > lbg) lbg = exact_redo_l(index, base_seed, lbg, tid, best_and_tid, all_arrays, all_idx);
         }
     }
 }
@@ -447,17 +619,32 @@ static unsigned long long best_floor(int f) {
 // would improve the report is guaranteed to be published.
 RangeResult compute_range(uint64_t base_seed, uint64_t lo, uint64_t hi,
                           int floorv, bool need_result,
-                          unsigned long long* dev_best, uint8_t* dev_arrays, uint64_t* dev_indices) {
+                          unsigned long long* dev_best, uint8_t* dev_arrays, uint64_t* dev_indices,
+                          unsigned long long* dev_worklist, unsigned int* dev_wcount) {
     RangeResult rr;
     rr.count = hi - lo;
 
     const auto t0 = std::chrono::high_resolution_clock::now();
     unsigned long long host_best = 0;
     for (int floor_try = 0; floor_try < 2; floor_try++) {
-        host_best = best_floor(floor_try == 0 ? floorv : 0);
+        const int curFloor = (floor_try == 0 ? floorv : 0);
+        host_best = best_floor(curFloor);
         CUDA_CHECK(cudaMemcpy(dev_best, &host_best, sizeof(host_best), cudaMemcpyHostToDevice));
-        bogo_range_h<THREADS_PER_BLOCK, ISTOP, BLOCK_SIZE><<<BLOCKS, THREADS_PER_BLOCK>>>(
-                base_seed, lo, hi, dev_best, dev_arrays, (unsigned long long*)dev_indices);
+        if (curFloor >= TWO_PHASE_FLOOR) {
+            // Two-phase: screen+bound scan -> worklist, then exact publish.
+            // Phase 1 uses the looser TWO_PHASE_SP1 screen; phase 2 the full ISTOP.
+            CUDA_CHECK(cudaMemset(dev_wcount, 0, sizeof(unsigned int)));
+            twophase_p1<THREADS_PER_BLOCK, TWO_PHASE_SP1, TWO_PHASE_N><<<BLOCKS, THREADS_PER_BLOCK>>>(
+                    base_seed, lo, hi, dev_best, dev_worklist, dev_wcount, WL_CAP);
+            twophase_p2<ISTOP><<<BLOCKS, THREADS_PER_BLOCK>>>(
+                    base_seed, dev_worklist, dev_wcount, WL_CAP, dev_best, dev_arrays,
+                    (unsigned long long*)dev_indices);
+        } else {
+            // Cold-start / floor-0 retry: survivors are too dense for the worklist
+            // (~40% at floor 8), so the integrated single-phase kernel wins.
+            bogo_range_h<THREADS_PER_BLOCK, ISTOP, BLOCK_SIZE><<<BLOCKS, THREADS_PER_BLOCK>>>(
+                    base_seed, lo, hi, dev_best, dev_arrays, (unsigned long long*)dev_indices);
+        }
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(&host_best, dev_best, sizeof(host_best), cudaMemcpyDeviceToHost));
@@ -518,9 +705,13 @@ void worker_thread(int) {
     unsigned long long* dev_best = nullptr;
     uint8_t* dev_arrays = nullptr;
     uint64_t* dev_indices = nullptr;
+    unsigned long long* dev_worklist = nullptr;   // two-phase survivor list
+    unsigned int* dev_wcount = nullptr;
     CUDA_CHECK(cudaMalloc((void**)&dev_best, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMalloc((void**)&dev_arrays, static_cast<uint64_t>(TOTAL_THREADS) * 25ULL));
     CUDA_CHECK(cudaMalloc((void**)&dev_indices, static_cast<uint64_t>(TOTAL_THREADS) * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc((void**)&dev_worklist, static_cast<uint64_t>(WL_CAP) * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc((void**)&dev_wcount, sizeof(unsigned int)));
 
     while (running.load(std::memory_order_relaxed)) {
         QueuedLease lease;
@@ -556,7 +747,7 @@ void worker_thread(int) {
                 // higher could silently drop a better find below it.
                 RangeResult rr = compute_range(base_seed, lo, hi,
                         winBest >= 0 ? winBest : BEST_FLOOR, winBest < 0,
-                        dev_best, dev_arrays, dev_indices);
+                        dev_best, dev_arrays, dev_indices, dev_worklist, dev_wcount);
 
                 totalDone = hi;
                 current_lease_done.store(totalDone, std::memory_order_relaxed);
@@ -589,6 +780,8 @@ void worker_thread(int) {
     if (dev_best) cudaFree(dev_best);
     if (dev_arrays) cudaFree(dev_arrays);
     if (dev_indices) cudaFree(dev_indices);
+    if (dev_worklist) cudaFree(dev_worklist);
+    if (dev_wcount) cudaFree(dev_wcount);
 }
 
 // ─── SENDER ──────────────────────────────────────────────────────────────────
