@@ -218,6 +218,18 @@ static std::string rate_string(double r) {
     else o << std::fixed << std::setprecision(0) << r << " /s";
     return o.str();
 }
+// Wall-clock since program start, formatted HH:MM:SS (with a leading "Nd " for
+// runs past a day) for the dashboard's TimeElapsed line.
+static std::string elapsed_string(double s) {
+    uint64_t total = (uint64_t)(s < 0.0 ? 0.0 : s);
+    uint64_t days = total / 86400, hours = (total % 86400) / 3600;
+    uint64_t mins = (total % 3600) / 60, secs = total % 60;
+    std::ostringstream o;
+    if (days > 0) o << days << "d ";
+    o << std::setfill('0') << std::setw(2) << hours << ":"
+      << std::setw(2) << mins << ":" << std::setw(2) << secs;
+    return o.str();
+}
 static void set_status(const std::string& s) { std::lock_guard<std::mutex> l(statusMutex); statusLine = s; }
 static void set_server_message(const std::string& s) { std::lock_guard<std::mutex> l(statusMutex); lastServerMessage = s; }
 static std::string json_redacted(json j) { if (j.contains("code")) j["code"] = "***"; return j.dump(); }
@@ -923,8 +935,10 @@ void dashboard_thread() {
         if (server.size() > 80) server.resize(80);
         std::cout << "\x1b[H";
         std::cout << "=== BOGOSORT CUDA WORKER " << WORKER_VERSION << " (lease API v5, TURBO h-mask) ===\n";
+        std::cout << "--- Made by: .Maf (discord) ---\n";
         std::cout << "Name:        " << NICKNAME << "\n";
         std::cout << "WebSocket:   " << (ws_open.load() ? "open" : "closed") << "\n";
+        std::cout << "TimeElapsed: " << elapsed_string(since_start_s()) << "          \n";
         std::cout << "Kernel rate: " << rate_string(gpu_rate.load()) << "          \n";
         std::cout << "Session:     " << comma_u64(global_shuffles.load()) << "          \n";
         std::cout << "Credited:    " << comma_u64(global_credit.load()) << "          \n";

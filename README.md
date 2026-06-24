@@ -73,6 +73,38 @@ the window open — see [`dist/README.md`](dist/README.md#if-something-goes-wron
 
 Requirements: Windows 10/11 x64, a recent NVIDIA driver, an RTX 20xx/30xx/40xx/50xx GPU. No CUDA Toolkit needed (static cudart) and no VC++ redist install needed (app-local DLLs). See [`dist/README.md`](dist/README.md).
 
+## Universal GPU worker (OpenCL — AMD / NVIDIA / Intel)
+
+For GPUs without a CUDA toolchain — **AMD** (RDNA / Vega / Polaris), **Intel**, or
+any NVIDIA card — there is a vendor-neutral **OpenCL** build in
+[`universal-gpu/`](universal-gpu/). The shuffle engine is pure integer math and
+**byte-identical** to the official engine and the CUDA build (validated against a
+CPU reference), so the server accepts every report. Nothing to install beyond the
+GPU driver.
+
+- **Automatic per-GPU tuning.** On startup the worker briefly benchmarks itself on
+  the GPU it is actually running on and locks in the fastest settings for *that*
+  card — work-group size, work-item count, chunk size, ILP width (`NILP`) and the
+  screen depths (`STOP`/`SP1`) — after warming the card to its sustained clock so
+  the choice matches production. No manual tuning needed; the chosen values are
+  shown on the `Tuned:` dashboard line.
+- **Stable rate read-out** (sustained throughput over a trailing window) and the
+  same dashboard as the CUDA worker.
+
+> **NVIDIA users: prefer the native CUDA build in [`dist/`](dist/).** Depending on
+> the GPU and driver, the OpenCL build runs roughly **5–20% slower than the native
+> CUDA core** (the auto-tuner narrows the gap). The OpenCL build is for **AMD /
+> Intel** and for machines with no CUDA toolchain — where it is the way to
+> contribute at all.
+
+> **⚠ Beta.** The universal (OpenCL) worker is in **beta**. In rare cases the
+> server may return a `rejected` for an individual report; this is **very rare**,
+> does not stop the worker, and does not lose credit for the shuffles already
+> scanned. The native CUDA build is the mature, server-verified 0-rejected path.
+
+Quick start, the per-card auto-tuning, the build scripts (Windows + Linux) and the
+tuning knobs are in [`universal-gpu/README.md`](universal-gpu/README.md).
+
 ## Build from source
 
 Everything is in [`src/`](src/) with auto-detecting build scripts for Windows (MSVC + CUDA + vcpkg) and Linux. Start with [`src/README.md`](src/README.md) — and build `bench2.exe` first: it validates every kernel against a CPU reference implementation, so you can prove your build is correct before pointing it at the server. `bench2.exe twophase` validates the two-phase path and measures it.
@@ -97,9 +129,10 @@ Every variant was validated against a CPU reference (best-score equality across 
 ## Repository layout
 
 ```
-dist/   prebuilt portable Windows binary + launcher + runtime DLLs
-src/    CUDA C++ sources, benchmark/validation suite, build scripts (Win + Linux)
-docs/   optimization write-up (EN summary + full CZ history)
+dist/           prebuilt portable Windows binary + launcher + runtime DLLs (NVIDIA/CUDA)
+universal-gpu/  vendor-neutral OpenCL worker (AMD/NVIDIA/Intel) with per-GPU auto-tuning
+src/            CUDA C++ sources, benchmark/validation suite, build scripts (Win + Linux)
+docs/           optimization write-up (EN summary + full CZ history)
 ```
 
 ## Credits
